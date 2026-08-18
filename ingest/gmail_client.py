@@ -62,14 +62,20 @@ def _decode_raw(raw: str | bytes) -> bytes:
     """Decode Gmail's base64url `raw` field into RFC-822 bytes.
 
     Gmail returns URL-safe base64 and omits padding, so padding is restored
-    before decoding. The result stays as bytes: it is handed to the parser
-    without ever becoming a str, so no charset guess is made here.
+    before decoding. Decoding is strict: `validate=True` rejects any character
+    outside the base64url alphabet instead of silently discarding it, so a
+    corrupted payload fails loudly rather than yielding truncated mail.
+
+    The result stays as bytes: it is handed to the parser without ever
+    becoming a str, so no charset guess is made here.
     """
-    if isinstance(raw, str):
-        raw = raw.encode("ascii", errors="strict")
-    padding = b"=" * (-len(raw) % 4)
     try:
-        return base64.urlsafe_b64decode(raw + padding)
+        # Encoding lives inside the boundary: a non-ASCII payload is a
+        # malformed payload, not an unhandled UnicodeEncodeError.
+        if isinstance(raw, str):
+            raw = raw.encode("ascii", errors="strict")
+        padding = b"=" * (-len(raw) % 4)
+        return base64.b64decode(raw + padding, altchars=b"-_", validate=True)
     except Exception as exc:  # noqa: BLE001 - malformed payload from Gmail
         raise GmailClientError("Gmail returned a raw payload that is not valid base64url") from exc
 
@@ -135,10 +141,28 @@ class GmailClient:
             raise GmailClientError("the Gmail OAuth flow did not complete") from exc
 
     def _save_credentials(self, credentials: Credentials) -> None:
-        """Cache the token in the gitignored credentials directory."""
+        """Cache the token in the gitignored credentials directory.
+
+        The file is created 0600 by `os.open`, never written world-readable
+        and tightened afterwards - there is no window in which the token sits
+        on disk with default permissions. An already-existing file is
+        tightened *before* it is rewritten, closing the same window on the
+        overwrite path. The containing directory is 0700.
+        """
         try:
-            self.token_file.parent.mkdir(parents=True, exist_ok=True)
-            self.token_file.write_text(credentials.to_json())
+            parent = self.token_file.parent
+            parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+            parent.chmod(0o700)  # a pre-existing directory may be looser
+
+            if self.token_file.exists():
+                self.token_file.chmod(0o600)
+
+            descriptor = os.open(
+                self.token_file, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600
+            )
+            with os.fdopen(descriptor, "w") as handle:
+                handle.write(credentials.to_json())
+
             self.token_file.chmod(0o600)
         except Exception as exc:  # noqa: BLE001
             raise GmailClientError(
@@ -234,6 +258,7 @@ class GmailClient:
 
         message_ids: list[str] = []
         page_token: str | None = None
+        seen_page_tokens: set[str] = set()
 
         while True:
             request_args: dict[str, object] = {"userId": self.user_id, "q": query}
@@ -250,7 +275,11 @@ class GmailClient:
                 raise GmailClientError("could not list Gmail messages") from exc
 
             if not isinstance(response, dict):
-                break
+                # Neither silently truncate the listing nor echo the payload
+                # back to the caller.
+                raise GmailClientError(
+                    "Gmail returned an unexpected response while listing messages"
+                )
 
             for message in response.get("messages") or []:
                 message_id = message.get("id") if isinstance(message, dict) else None
@@ -262,5 +291,11 @@ class GmailClient:
             page_token = response.get("nextPageToken")
             if not page_token:
                 break
+            if page_token in seen_page_tokens:
+                # Gmail handed back a token we have already followed. Without
+                # a max_results ceiling that would loop forever, so stop with
+                # what we have rather than spinning.
+                break
+            seen_page_tokens.add(page_token)
 
         return message_ids

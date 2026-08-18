@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import base64
 import json
+import stat
 
 import pytest
 
@@ -115,6 +116,29 @@ def test_base64url_specific_alphabet_is_handled():
     messages = FakeMessages(get_result={"raw": encoded})
 
     assert _client(messages).fetch_raw("m1") == raw
+
+
+def test_non_ascii_raw_payload_becomes_a_client_error():
+    """Encoding happens inside the boundary, so this is not a stray UnicodeError."""
+    messages = FakeMessages(get_result={"raw": "not-base64-\u00e9\u00e8"})
+
+    with pytest.raises(GmailClientError, match="base64url"):
+        _client(messages).fetch_raw("m1")
+
+
+def test_invalid_base64_characters_are_rejected_rather_than_discarded():
+    """Strict decoding: a corrupt payload must fail, not decode to truncated mail."""
+    messages = FakeMessages(get_result={"raw": "RnJvbTo!!!gYUBiLmM="})
+
+    with pytest.raises(GmailClientError, match="base64url"):
+        _client(messages).fetch_raw("m1")
+
+
+def test_embedded_whitespace_in_payload_is_rejected():
+    messages = FakeMessages(get_result={"raw": "RnJvbTo\ngYUBiLmM="})
+
+    with pytest.raises(GmailClientError, match="base64url"):
+        _client(messages).fetch_raw("m1")
 
 
 def test_decoded_bytes_are_passed_unchanged_to_the_parser(monkeypatch):
@@ -251,6 +275,50 @@ def test_listing_does_not_request_message_bodies():
 
     assert "format" not in messages.list_calls[0]
     assert messages.get_calls == []
+
+
+def test_unexpected_list_response_shape_becomes_a_client_error():
+    messages = FakeMessages(list_pages=[["unexpected", "list", "instead", "of", "dict"]])
+
+    with pytest.raises(GmailClientError) as excinfo:
+        _client(messages).list_message_ids("in:inbox")
+
+    message = str(excinfo.value)
+    assert "unexpected response" in message
+    # The response body itself must not be echoed back.
+    assert "unexpected response while listing" in message
+    assert "instead" not in message
+
+
+def test_repeated_page_token_terminates_instead_of_looping_forever():
+    """A Gmail bug or hostile proxy must not spin the loop indefinitely."""
+
+    class RepeatingMessages(FakeMessages):
+        def list(self, **kwargs):
+            self.list_calls.append(kwargs)
+            # Always the same token, so an unguarded loop never terminates.
+            return FakeExecutable(
+                result={"messages": [{"id": "a"}], "nextPageToken": "SAME-TOKEN"}
+            )
+
+    messages = RepeatingMessages()
+
+    ids = _client(messages).list_message_ids("in:inbox")
+
+    assert ids == ["a", "a"]
+    assert len(messages.list_calls) == 2
+
+
+def test_repeated_page_token_guard_does_not_disturb_normal_pagination():
+    messages = FakeMessages(
+        list_pages=[
+            {"messages": [{"id": "a"}], "nextPageToken": "T1"},
+            {"messages": [{"id": "b"}], "nextPageToken": "T2"},
+            {"messages": [{"id": "c"}]},
+        ]
+    )
+
+    assert _client(messages).list_message_ids("in:inbox") == ["a", "b", "c"]
 
 
 def test_non_positive_max_results_returns_nothing_without_calling_gmail():
@@ -467,7 +535,7 @@ def test_refresh_failure_becomes_a_client_error(monkeypatch, tmp_path):
         GmailClient(token_file=token_file)._credentials()
 
 
-def test_saved_token_file_is_not_world_readable(monkeypatch, tmp_path):
+def test_saved_token_file_is_created_with_mode_0600(monkeypatch, tmp_path):
     token_file = tmp_path / "nested" / "token.json"
     monkeypatch.setattr(
         GmailClient, "_run_installed_app_flow", lambda self: FakeCredentials(valid=True)
@@ -475,7 +543,77 @@ def test_saved_token_file_is_not_world_readable(monkeypatch, tmp_path):
 
     GmailClient(token_file=token_file)._credentials()
 
-    assert token_file.stat().st_mode & 0o077 == 0
+    assert stat.S_IMODE(token_file.stat().st_mode) == 0o600
+
+
+def test_saved_token_parent_directory_is_restrictive(monkeypatch, tmp_path):
+    token_file = tmp_path / "nested" / "token.json"
+    monkeypatch.setattr(
+        GmailClient, "_run_installed_app_flow", lambda self: FakeCredentials(valid=True)
+    )
+
+    GmailClient(token_file=token_file)._credentials()
+
+    assert stat.S_IMODE(token_file.parent.stat().st_mode) == 0o700
+
+
+def test_token_is_never_created_with_default_permissions(monkeypatch, tmp_path):
+    """The file must be 0600 from creation, not chmod'ed after the fact.
+
+    Recording the mode at first write proves there is no window in which the
+    token exists on disk world-readable.
+    """
+    token_file = tmp_path / "token.json"
+    modes: list[int] = []
+
+    class RecordingCredentials(FakeCredentials):
+        def to_json(self):
+            # Called while the descriptor is open, before any later chmod.
+            modes.append(stat.S_IMODE(token_file.stat().st_mode))
+            return json.dumps({"token": "fake"})
+
+    monkeypatch.setattr(
+        GmailClient, "_run_installed_app_flow", lambda self: RecordingCredentials(valid=True)
+    )
+
+    GmailClient(token_file=token_file)._credentials()
+
+    assert modes == [0o600]
+
+
+def test_existing_loose_token_file_is_tightened(tmp_path):
+    token_file = tmp_path / "token.json"
+    token_file.write_text('{"stale": true}')
+    token_file.chmod(0o644)
+
+    GmailClient(token_file=token_file)._save_credentials(FakeCredentials(valid=True))
+
+    assert stat.S_IMODE(token_file.stat().st_mode) == 0o600
+    assert json.loads(token_file.read_text()) == {"token": "fake"}
+
+
+def test_existing_loose_parent_directory_is_tightened(monkeypatch, tmp_path):
+    credentials_dir = tmp_path / "creds"
+    credentials_dir.mkdir(mode=0o755)
+    monkeypatch.setattr(
+        GmailClient, "_run_installed_app_flow", lambda self: FakeCredentials(valid=True)
+    )
+
+    GmailClient(token_file=credentials_dir / "token.json")._credentials()
+
+    assert stat.S_IMODE(credentials_dir.stat().st_mode) == 0o700
+
+
+def test_token_write_failure_is_still_wrapped(tmp_path):
+    """The GmailClientError wrapping around saving must survive the hardening."""
+    # A directory where the token file should be makes the write fail.
+    token_file = tmp_path / "token.json"
+    token_file.mkdir()
+
+    with pytest.raises(GmailClientError, match="could not write") as excinfo:
+        GmailClient(token_file=token_file)._save_credentials(FakeCredentials(valid=True))
+
+    assert excinfo.value.__cause__ is not None
 
 
 # --------------------------------------------------------------------------
