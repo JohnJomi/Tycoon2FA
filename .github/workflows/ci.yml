@@ -1,0 +1,41 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Validate Python syntax
+        run: python -m compileall -q core ingest layers scoring storage api eval training
+
+      - name: Run pytest
+        run: |
+          set +e
+          python -m pytest
+          code=$?
+          set -e
+          # Exit code 5 means "no tests collected". The Phase 0 scaffold has no
+          # tests yet; that is expected and must not fail the build. Remove this
+          # allowance once the first real test lands.
+          if [ "$code" -eq 5 ]; then
+            echo "::notice::No tests collected yet (Phase 0 scaffold)."
+            exit 0
+          fi
+          exit "$code"
