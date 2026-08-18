@@ -158,6 +158,13 @@ class ParsedEmail:
     Deliberately not coupled to Gmail or to any MIME parser: ingest/parser.py
     populates it from an RFC-822 message, but nothing here knows how. `raw` is
     optional so an email can be constructed in tests without carrying bytes.
+
+    `from_addr` and `from_display` may be empty. A message with a missing,
+    empty or unparseable From header is still a message worth analysing - the
+    absent sender is itself evidence for Layer 1 - so ingest represents what
+    was actually there rather than rejecting the message or inventing a
+    placeholder. The parser extracts what exists; detection decides whether
+    what exists is suspicious.
     """
 
     message_id: str
@@ -176,7 +183,6 @@ class ParsedEmail:
 
     def __post_init__(self) -> None:
         _require_non_empty(self.message_id, "message_id")
-        _require_non_empty(self.from_addr, "from_addr")
 
     @property
     def inline_images(self) -> list[Attachment]:

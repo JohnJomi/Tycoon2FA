@@ -150,9 +150,40 @@ def test_parsed_email_rejects_blank_message_id(bad_value):
         ParsedEmail(message_id=bad_value, from_addr="a@example.com")
 
 
-def test_parsed_email_rejects_blank_from_addr():
-    with pytest.raises(ValueError, match="from_addr"):
-        ParsedEmail(message_id="<x@example.com>", from_addr="")
+def test_parsed_email_allows_an_empty_sender():
+    """A message with no recoverable From is still representable.
+
+    The absent sender is evidence for Layer 1, so ingest must be able to hand
+    the message on rather than rejecting it.
+    """
+    email = ParsedEmail(message_id="<x@example.com>", from_addr="")
+
+    assert email.from_addr == ""
+    assert email.from_display == ""
+
+
+def test_parsed_email_allows_an_empty_display_name_with_a_real_address():
+    email = ParsedEmail(message_id="<x@example.com>", from_addr="a@example.com", from_display="")
+
+    assert email.from_addr == "a@example.com"
+    assert email.from_display == ""
+
+
+def test_parsed_email_with_empty_sender_keeps_its_other_fields():
+    email = ParsedEmail(
+        message_id="<x@example.com>",
+        from_addr="",
+        subject="Still parsed",
+        to_addrs=["victim@example.org"],
+    )
+
+    assert email.subject == "Still parsed"
+    assert email.to_addrs == ["victim@example.org"]
+
+
+def test_parsed_email_still_requires_a_message_id():
+    with pytest.raises(ValueError, match="message_id"):
+        ParsedEmail(message_id="", from_addr="a@example.com")
 
 
 # --------------------------------------------------------------------------

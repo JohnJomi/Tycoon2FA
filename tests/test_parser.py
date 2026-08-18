@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import pytest
 
-from core.models import ParsedEmail, URLSource
+from core.models import ParsedEmail, RiskAssessment, RiskLevel, URLSource
 from ingest.parser import EmailParseError, parse_email
 
 # --------------------------------------------------------------------------
@@ -229,8 +229,29 @@ NO_SENDER = b"""\
 Message-ID: <nosender@example.com>
 To: victim@example.org
 Subject: No From header
+Content-Type: text/html; charset="utf-8"
 
-Body with no From header at all.
+<html><body><a href="https://nosender.example.com/login">Sign in</a></body></html>
+"""
+
+EMPTY_SENDER = b"""\
+Message-ID: <emptysender@example.com>
+From:
+To: victim@example.org
+Subject: Empty From header
+Content-Type: text/plain; charset="utf-8"
+
+Body with an empty From header.
+"""
+
+UNPARSEABLE_SENDER = b"""\
+Message-ID: <badsender@example.com>
+From: <<<not an address at all>>>
+To: victim@example.org
+Subject: Unparseable From header
+Content-Type: text/plain; charset="utf-8"
+
+Body with a From header that is not an address.
 """
 
 
@@ -585,19 +606,19 @@ payload
     assert [a.filename for a in email.attachments] == ["a.pdf"]
 
 
-def test_input_that_is_not_an_email_at_all_does_not_raise_uncontrolled():
-    with pytest.raises(EmailParseError):
-        parse_email(b"this is not an email, just some bytes\x00\xff")
+def test_input_that_is_not_an_email_at_all_does_not_raise():
+    email = parse_email(b"this is not an email, just some bytes\x00\xff")
+
+    assert email.from_addr == ""
+    assert email.message_id.startswith("sha256:")
 
 
-def test_empty_input_raises_a_controlled_parse_error():
-    with pytest.raises(EmailParseError):
-        parse_email(b"")
+def test_empty_input_does_not_raise():
+    email = parse_email(b"")
 
-
-def test_missing_sender_raises_a_controlled_error_rather_than_fabricating_one():
-    with pytest.raises(EmailParseError, match="sender"):
-        parse_email(NO_SENDER)
+    assert email.from_addr == ""
+    assert email.subject == ""
+    assert email.message_id.startswith("sha256:")
 
 
 def test_headers_only_message_yields_empty_body():
@@ -613,6 +634,96 @@ def test_non_bytes_input_is_rejected():
     with pytest.raises(TypeError):
         parse_email("already a string")
 
+
+# --------------------------------------------------------------------------
+# Missing / empty / unparseable sender
+#
+# Principle: the parser extracts what exists; detection decides whether what
+# exists is suspicious. An absent sender is evidence, not a reason to reject.
+# --------------------------------------------------------------------------
+
+
+def test_email_without_a_from_header_parses_successfully():
+    email = parse_email(NO_SENDER)
+
+    assert isinstance(email, ParsedEmail)
+    assert email.from_addr == ""
+    assert email.from_display == ""
+
+
+def test_email_with_an_empty_from_header_parses_successfully():
+    email = parse_email(EMPTY_SENDER)
+
+    assert email.from_addr == ""
+    assert email.from_display == ""
+
+
+def test_email_with_an_unparseable_from_header_parses_successfully():
+    email = parse_email(UNPARSEABLE_SENDER)
+
+    assert email.from_addr == ""
+    assert email.subject == "Unparseable From header"
+
+
+def test_parser_does_not_invent_a_sender():
+    for raw in (NO_SENDER, EMPTY_SENDER, UNPARSEABLE_SENDER):
+        email = parse_email(raw)
+
+        assert email.from_addr == ""
+        assert email.from_display == ""
+        assert "@" not in email.from_addr
+        assert "unknown" not in email.from_addr.lower()
+        assert "invalid" not in email.from_addr.lower()
+
+
+def test_other_fields_survive_a_missing_sender():
+    email = parse_email(NO_SENDER)
+
+    assert email.message_id == "<nosender@example.com>"
+    assert email.to_addrs == ["victim@example.org"]
+    assert email.subject == "No From header"
+    assert [u.url for u in email.urls] == ["https://nosender.example.com/login"]
+    assert email.urls[0].source is URLSource.ANCHOR_HREF
+
+
+def test_a_present_but_unparseable_from_header_is_still_recorded():
+    """The From header is recorded even when no address can be pulled from it.
+
+    Note the stdlib address-header parser normalizes badly broken input when
+    rendering it, so `headers["from"]` holds its normalized form rather than
+    the original bytes. The untouched original remains on `ParsedEmail.raw`,
+    which is where a detector should look if it needs byte fidelity.
+    """
+    email = parse_email(UNPARSEABLE_SENDER)
+
+    assert "from" in email.headers
+    assert email.from_addr == ""
+    assert b"not an address at all" in email.raw
+
+
+def test_a_message_with_no_from_header_records_no_from_key():
+    assert "from" not in parse_email(NO_SENDER).headers
+
+
+def test_email_without_a_sender_can_reach_a_later_stage():
+    """A senderless ParsedEmail is a valid input to downstream consumers.
+
+    This asserts only that the object flows on intact - it is not a detector
+    and encodes no detection behaviour.
+    """
+    email = parse_email(NO_SENDER)
+
+    def downstream_consumer(parsed: ParsedEmail) -> RiskAssessment:
+        return RiskAssessment(
+            message_id=parsed.message_id,
+            score=0.0,
+            level=RiskLevel.LOW,
+            layers_completed=[],
+        )
+
+    assessment = downstream_consumer(email)
+
+    assert assessment.message_id == email.message_id
 
 # --------------------------------------------------------------------------
 # 16. Deterministic Message-ID fallback

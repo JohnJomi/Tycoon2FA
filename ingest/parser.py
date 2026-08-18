@@ -25,6 +25,14 @@ content hash, never a random UUID, so re-parsing the same message yields the
 same id and a cache lookup stays stable. The ``sha256:`` prefix makes a
 synthesized id obvious at a glance.
 
+Sender
+------
+`from_addr` and `from_display` are whatever the From header actually yielded,
+and both may be empty. A missing, empty or unparseable From header does not
+stop a message from being parsed: the absence is itself evidence for Layer 1,
+and no placeholder sender is ever invented to fill the gap. The parser
+extracts what exists; detection decides whether what exists is suspicious.
+
 Untrusted input
 ---------------
 Every email is treated as hostile. Parsing uses the standard library's
@@ -53,13 +61,12 @@ __all__ = ["EmailParseError", "parse_email"]
 
 
 class EmailParseError(ValueError):
-    """Raised when input cannot be represented as a ParsedEmail at all.
+    """Raised when input cannot be turned into a message object at all.
 
-    Reserved for the case where a field the contract requires cannot be
-    recovered - in practice a missing or unparseable sender address. The
-    parser deliberately does not invent a placeholder sender, because the
-    sender is security-relevant and a fabricated one would be indistinguishable
-    downstream from a real one.
+    Defensive: both the modern and the legacy stdlib parsers accept essentially
+    any byte string, so this is reserved for the case where even the tolerant
+    fallback fails. A missing sender is emphatically *not* such a case - see
+    the module docstring.
     """
 
 
@@ -85,8 +92,8 @@ _URL_BEARING_ATTRS: tuple[tuple[str, str, URLSource], ...] = (
 def parse_email(raw: bytes) -> ParsedEmail:
     """Normalize raw RFC-822 bytes into a ParsedEmail.
 
-    Raises EmailParseError when no sender address can be recovered; see the
-    class docstring for why that case is not papered over.
+    An email with no recoverable sender still parses; `from_addr` and
+    `from_display` come back empty rather than fabricated.
     """
     if not isinstance(raw, (bytes, bytearray)):
         raise TypeError(f"raw must be bytes, got {type(raw).__name__}")
@@ -96,11 +103,6 @@ def parse_email(raw: bytes) -> ParsedEmail:
 
     headers = _collect_headers(message)
     from_display, from_addr = _parse_sender(message)
-    if not from_addr:
-        raise EmailParseError(
-            "no sender address could be recovered from the From header; "
-            "refusing to fabricate one"
-        )
 
     body_text, body_html = _extract_bodies(message)
 
@@ -137,7 +139,11 @@ def _parse_message(raw: bytes) -> Message:
     try:
         return BytesParser(policy=policy.default).parsebytes(raw)
     except Exception:  # noqa: BLE001 - untrusted input, any failure falls back
+        pass
+    try:
         return message_from_bytes(raw)
+    except Exception as exc:  # noqa: BLE001 - both parsers gave up
+        raise EmailParseError(f"input could not be parsed as an email: {exc}") from exc
 
 
 # --------------------------------------------------------------------------
@@ -187,7 +193,11 @@ def _collect_headers(message: Message) -> dict[str, list[str]]:
 
 
 def _parse_sender(message: Message) -> tuple[str, str]:
-    """(display name, address) from From. Either may be empty."""
+    """(display name, address) from From. Either or both may be empty.
+
+    An absent, empty or unparseable From header yields ("", "") - never an
+    invented address.
+    """
     display, addr = parseaddr(_header(message, "From"))
     return display.strip(), addr.strip()
 
