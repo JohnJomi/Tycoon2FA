@@ -10,7 +10,7 @@ from __future__ import annotations
 import pytest
 
 from core.models import ParsedEmail, RiskAssessment, RiskLevel, URLSource
-from ingest.parser import EmailParseError, parse_email
+from ingest.parser import parse_email
 
 # --------------------------------------------------------------------------
 # Fixtures - raw RFC-822 bytes

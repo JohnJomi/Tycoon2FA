@@ -77,11 +77,12 @@ _TEXT_URL_RE = re.compile(r"https?://[^\s<>\"'`\[\]{}\\^|]+", re.IGNORECASE)
 # Punctuation that commonly trails a URL in prose rather than belonging to it.
 _TRAILING_PUNCTUATION = ".,;:!?\"'>*_~"
 
-_URL_BEARING_ATTRS: tuple[tuple[str, str, URLSource], ...] = (
-    ("a", "href", URLSource.ANCHOR_HREF),
-    ("img", "src", URLSource.IMG_SRC),
-    ("form", "action", URLSource.FORM_ACTION),
-)
+# tag name -> (attribute holding the URL, source recorded for it)
+_URL_BEARING_ATTRS: dict[str, tuple[str, URLSource]] = {
+    "a": ("href", URLSource.ANCHOR_HREF),
+    "img": ("src", URLSource.IMG_SRC),
+    "form": ("action", URLSource.FORM_ACTION),
+}
 
 
 # --------------------------------------------------------------------------
@@ -138,7 +139,7 @@ def _parse_message(raw: bytes) -> Message:
     """
     try:
         return BytesParser(policy=policy.default).parsebytes(raw)
-    except Exception:  # noqa: BLE001 - untrusted input, any failure falls back
+    except Exception:  # noqa: BLE001, S110 - untrusted input, any failure falls back
         pass
     try:
         return message_from_bytes(raw)
@@ -186,7 +187,7 @@ def _collect_headers(message: Message) -> dict[str, list[str]]:
     for name, value in items:
         try:
             key = str(name).lower()
-        except Exception:  # noqa: BLE001
+        except Exception:  # noqa: BLE001, S112
             continue
         headers.setdefault(key, []).append(_as_text(value))
     return headers
@@ -263,7 +264,7 @@ def _part_text(part: Message) -> str:
         content = part.get_content()
         if isinstance(content, str):
             return content
-    except Exception:  # noqa: BLE001 - unknown charset, broken encoding
+    except Exception:  # noqa: BLE001, S110 - unknown charset, broken encoding
         pass
     try:
         payload = part.get_payload(decode=True)
@@ -301,7 +302,7 @@ def _extract_bodies(message: Message) -> tuple[str, str | None]:
             if part.get_content_maintype() == "multipart":
                 continue
             content_type = part.get_content_type()
-        except Exception:  # noqa: BLE001
+        except Exception:  # noqa: BLE001, S112
             continue
         if _is_attachment_part(part):
             continue
@@ -369,8 +370,11 @@ def _soup(html: str) -> BeautifulSoup | None:
 def _extract_urls(body_text: str, body_html: str | None) -> list[ExtractedURL]:
     """Collect URLs from the HTML attributes and the plaintext body.
 
-    HTML is scanned first so that when the same URL appears both as a link and
-    as visible text, the richer anchor observation is the one kept.
+    HTML is scanned first, so HTML-derived observations are emitted before
+    plaintext ones. Distinct sources are retained rather than collapsed: the
+    same URL seen both as a link and as visible text yields one ANCHOR_HREF
+    observation and one PLAIN_TEXT observation, because deduplication keys on
+    (url, source).
 
     The plaintext body is always scanned, including when it was derived from
     HTML: that is the only way to catch a bare URL written as text and never
@@ -388,24 +392,28 @@ def _extract_urls(body_text: str, body_html: str | None) -> list[ExtractedURL]:
 
 
 def _urls_from_html(html: str) -> list[ExtractedURL]:
-    """URLs from <a href>, <img src> and <form action>, in document order."""
+    """URLs from <a href>, <img src> and <form action>, in document order.
+
+    A single traversal over all three tag names, so observations come back in
+    the order they appear in the markup rather than grouped by tag.
+    """
     soup = _soup(html)
     if soup is None:
         return []
 
     found: list[ExtractedURL] = []
-    for tag_name, attribute, source in _URL_BEARING_ATTRS:
-        for element in soup.find_all(tag_name):
-            value = element.get(attribute)
-            if not isinstance(value, str):
-                continue
-            url = _normalize(value)
-            if not url:
-                continue
-            anchor_text = None
-            if source is URLSource.ANCHOR_HREF:
-                anchor_text = element.get_text(strip=True) or None
-            found.append(ExtractedURL(url=url, source=source, anchor_text=anchor_text))
+    for element in soup.find_all(list(_URL_BEARING_ATTRS)):
+        attribute, source = _URL_BEARING_ATTRS[element.name]
+        value = element.get(attribute)
+        if not isinstance(value, str):
+            continue
+        url = _normalize(value)
+        if not url:
+            continue
+        anchor_text = None
+        if source is URLSource.ANCHOR_HREF:
+            anchor_text = element.get_text(strip=True) or None
+        found.append(ExtractedURL(url=url, source=source, anchor_text=anchor_text))
     return found
 
 
@@ -520,7 +528,7 @@ def _extract_attachments(message: Message) -> list[Attachment]:
         try:
             if part.get_content_maintype() == "multipart":
                 continue
-        except Exception:  # noqa: BLE001
+        except Exception:  # noqa: BLE001, S112
             continue
         if not _is_attachment_part(part):
             continue
