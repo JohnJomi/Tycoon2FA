@@ -1,0 +1,50 @@
+# --- Secrets and credentials ---
+.env
+.env.*
+!.env.example
+.credentials/*
+!.credentials/.gitkeep
+*client_secret*.json
+token.json
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# --- Generated model files ---
+models/*
+!models/.gitkeep
+
+# --- Local databases ---
+*.db
+*.sqlite
+*.sqlite3
+
+# --- Evaluation and corpus artifacts ---
+eval/results/
+data/corpus/*
+!data/corpus/.gitkeep
+
+# --- Frontend (Phase 6, not created yet) ---
+node_modules/
+ui/dist/
+
+# --- OS / editor ---
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+
+# --- Source archive (redundant copy of the tracked .md docs) ---
+Tycoon2fa.zip
+
+# --- Claude Code local settings ---
+.claude/settings.local.json

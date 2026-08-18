@@ -1,0 +1,28 @@
+# Baseline scaffold dependencies only (Python 3.11+).
+# Layer-specific and ML/browser dependencies are added by the task that needs
+# them, not guessed here.
+
+# API surface (ARCHITECTURE.md section 8)
+fastapi>=0.115
+uvicorn[standard]>=0.30
+
+# Email / HTML parsing (ARCHITECTURE.md section 3)
+beautifulsoup4>=4.12
+lxml>=5.2
+
+# Config and environment
+pyyaml>=6.0
+python-dotenv>=1.0
+
+# HTTP client (also backs the FastAPI test client)
+httpx>=0.27
+
+# Tests
+pytest>=8.2
+pytest-asyncio>=0.23
+
+# Deliberately deferred until the phase that needs them:
+#   Phase 1  google-api-python-client, google-auth-oauthlib  (Gmail OAuth)
+#   Phase 2  tldextract, python-whois                        (Layer 1)
+#   Phase 2  scikit-learn, joblib, torch, transformers       (Layer 3)
+#   Phase 3  playwright, pyzbar, Pillow                      (Layer 2)

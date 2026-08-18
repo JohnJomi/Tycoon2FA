@@ -1,0 +1,19 @@
+# Phase A composite scoring weights (ARCHITECTURE.md section 6).
+#
+# These values are hand-assigned pre-evaluation. Phase 5 refits them with a
+# LogisticRegression over the labelled corpus and re-derives the thresholds
+# from the ROC curve rather than guessing them.
+#
+# Verdict bands: deliver < 0.35 <= warn < 0.65 <= block
+#
+# Nothing reads this file yet - scoring/composite.py is not implemented.
+
+layers:
+  l1: 0.30
+  l2: 0.30
+  l3: 0.20
+  l4: 0.20
+
+thresholds:
+  deliver: 0.35
+  block: 0.65
