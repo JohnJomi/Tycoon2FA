@@ -24,6 +24,7 @@ __all__ = [
     "ExtractedURL",
     "ParsedEmail",
     "DetectionSignal",
+    "LayerResult",
     "RiskAssessment",
 ]
 
@@ -234,6 +235,37 @@ class DetectionSignal:
     def qualified_name(self) -> str:
         """Stable identifier of the form "L2/redirect_depth"."""
         return f"{self.layer.name}/{self.name}"
+
+
+@dataclass
+class LayerResult:
+    """What one detection layer returned, per ARCHITECTURE.md section 2.
+
+    **`completed=False` means the layer failed or abstained and must not be
+    interpreted as "no threat found."** A completed layer with zero signals is
+    a genuine negative: it ran, it looked, it found nothing. An incomplete
+    layer is an absence of information - it timed out, crashed, or could not
+    reach a dependency. Collapsing the two into "clean" silently turns an
+    outage into an all-clear, which is why scoring renormalizes over completed
+    layers rather than scoring a missing layer as 0.
+
+    `error` carries the reason a layer could not complete. `duration_ms` feeds
+    the latency budget in section 5.
+    """
+
+    layer: DetectionLayer
+    completed: bool
+    signals: list[DetectionSignal] = field(default_factory=list)
+    error: str | None = None
+    duration_ms: int = 0
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.layer, DetectionLayer):
+            raise TypeError(f"layer must be a DetectionLayer, got {type(self.layer).__name__}")
+        if not isinstance(self.completed, bool):
+            raise TypeError(f"completed must be a bool, got {type(self.completed).__name__}")
+        if self.duration_ms < 0:
+            raise ValueError(f"duration_ms must not be negative, got {self.duration_ms!r}")
 
 
 @dataclass
