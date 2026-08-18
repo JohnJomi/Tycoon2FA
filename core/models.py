@@ -264,8 +264,23 @@ class LayerResult:
             raise TypeError(f"layer must be a DetectionLayer, got {type(self.layer).__name__}")
         if not isinstance(self.completed, bool):
             raise TypeError(f"completed must be a bool, got {type(self.completed).__name__}")
+        if isinstance(self.duration_ms, bool) or not isinstance(self.duration_ms, int):
+            raise TypeError(
+                f"duration_ms must be an int, got {type(self.duration_ms).__name__}"
+            )
         if self.duration_ms < 0:
             raise ValueError(f"duration_ms must not be negative, got {self.duration_ms!r}")
+
+        # The completed/incomplete distinction is the contract's whole point,
+        # so the two states are enforced rather than merely documented.
+        if self.completed:
+            if self.error is not None:
+                raise ValueError("a completed layer must not carry an error")
+        else:
+            if self.signals:
+                raise ValueError("an incomplete layer must not carry signals")
+            if not (self.error or "").strip():
+                raise ValueError("an incomplete layer must state why it did not complete")
 
 
 @dataclass

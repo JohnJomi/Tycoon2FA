@@ -305,6 +305,8 @@ async def test_total_budget_backstop_reports_absence_not_a_clean_run(email):
     assert all(r.completed is False for r in results)
     assert all(r.signals == [] for r in results)
     assert all("total budget" in r.error for r in results)
+    # The elapsed time is recorded, not left at the default 0.
+    assert all(r.duration_ms > 0 for r in results)
 
 
 @pytest.mark.asyncio
@@ -410,6 +412,49 @@ async def test_a_failing_layer_is_never_reported_as_clean(email):
 
     assert not (l4.completed is True and l4.signals == [])
     assert l4.completed is False
+
+
+@pytest.mark.asyncio
+async def test_layer_returning_none_is_incomplete_not_an_empty_success(email):
+    """None is a broken layer, not a genuine negative."""
+
+    async def returns_none(_email):
+        return None
+
+    results = _by_layer(await run_layers(email, layers={DetectionLayer.L2: returns_none}))
+    l2 = results[DetectionLayer.L2]
+
+    assert l2.completed is False
+    assert l2.signals == []
+    assert l2.error is not None
+    assert "None" in l2.error
+
+
+@pytest.mark.asyncio
+async def test_a_none_returning_layer_does_not_stop_the_others(email):
+    async def returns_none(_email):
+        return None
+
+    results = _by_layer(await run_layers(email, layers={DetectionLayer.L2: returns_none}))
+
+    assert results[DetectionLayer.L2].completed is False
+    for layer in (DetectionLayer.L1, DetectionLayer.L3, DetectionLayer.L4):
+        assert results[layer].completed is True
+
+
+@pytest.mark.asyncio
+async def test_partial_custom_layer_mapping_still_runs_all_four_layers(email):
+    """Supplying one layer overrides that default; it does not replace them all."""
+    results = await run_layers(
+        email, layers={DetectionLayer.L2: make_signal_layer(DetectionLayer.L2, "custom")}
+    )
+
+    assert [r.layer for r in results] == ALL_LAYERS
+    assert results[1].signals[0].name == "custom"
+    # The untouched defaults still ran.
+    assert results[0].signals[0].name == STUB_L1_SIGNAL_NAME
+    assert results[2].completed is True and results[2].signals == []
+    assert results[3].completed is True and results[3].signals == []
 
 
 # --------------------------------------------------------------------------

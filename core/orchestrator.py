@@ -81,7 +81,12 @@ async def _run_layer(
     started = time.perf_counter()
     try:
         produced = await asyncio.wait_for(run(email), timeout=timeout)
-        signals = list(produced) if produced else []
+        if produced is None:
+            # A layer that returns nothing has not "found nothing" - it is
+            # broken. Treating None as an empty success would report a
+            # defective layer as a genuine negative.
+            raise TypeError("layer returned None instead of a sequence of signals")
+        signals = list(produced)
     except asyncio.TimeoutError:
         return LayerResult(
             layer=layer,
@@ -126,7 +131,11 @@ async def run_layers(
     `layers` and `timeouts` exist so callers and tests can substitute layer
     implementations and shrink the clock; both default to the real mapping.
     """
-    layer_map = dict(layers) if layers is not None else dict(DEFAULT_LAYERS)
+    # Start from the defaults so a partial mapping overrides only the layers
+    # it names; L1-L4 always run.
+    layer_map = dict(DEFAULT_LAYERS)
+    if layers:
+        layer_map.update(layers)
     timeout_map = dict(DEFAULT_LAYER_TIMEOUTS)
     if timeouts:
         timeout_map.update(timeouts)
@@ -137,6 +146,7 @@ async def run_layers(
         for layer in ordered
     ]
 
+    started = time.perf_counter()
     gathered = asyncio.gather(*pending, return_exceptions=True)
     try:
         results = await (
@@ -148,12 +158,14 @@ async def run_layers(
         # The backstop fired: a layer would not yield even to cancellation, so
         # nothing can be trusted to have finished. Report absence of
         # information for every layer rather than a fabricated all-clear.
+        elapsed_ms = _elapsed_ms(started)
         return [
             LayerResult(
                 layer=layer,
                 completed=False,
                 signals=[],
                 error=f"pipeline exceeded its {total_timeout:g}s total budget",
+                duration_ms=elapsed_ms,
             )
             for layer in ordered
         ]
@@ -169,6 +181,7 @@ async def run_layers(
             completed=False,
             signals=[],
             error=f"orchestrator error: {type(result).__name__}: {result}",
+            duration_ms=_elapsed_ms(started),
         )
         for layer, result in zip(ordered, results)
     ]
