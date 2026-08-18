@@ -24,6 +24,7 @@ __all__ = [
     "ExtractedURL",
     "ParsedEmail",
     "DetectionSignal",
+    "LayerResult",
     "RiskAssessment",
 ]
 
@@ -234,6 +235,52 @@ class DetectionSignal:
     def qualified_name(self) -> str:
         """Stable identifier of the form "L2/redirect_depth"."""
         return f"{self.layer.name}/{self.name}"
+
+
+@dataclass
+class LayerResult:
+    """What one detection layer returned, per ARCHITECTURE.md section 2.
+
+    **`completed=False` means the layer failed or abstained and must not be
+    interpreted as "no threat found."** A completed layer with zero signals is
+    a genuine negative: it ran, it looked, it found nothing. An incomplete
+    layer is an absence of information - it timed out, crashed, or could not
+    reach a dependency. Collapsing the two into "clean" silently turns an
+    outage into an all-clear, which is why scoring renormalizes over completed
+    layers rather than scoring a missing layer as 0.
+
+    `error` carries the reason a layer could not complete. `duration_ms` feeds
+    the latency budget in section 5.
+    """
+
+    layer: DetectionLayer
+    completed: bool
+    signals: list[DetectionSignal] = field(default_factory=list)
+    error: str | None = None
+    duration_ms: int = 0
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.layer, DetectionLayer):
+            raise TypeError(f"layer must be a DetectionLayer, got {type(self.layer).__name__}")
+        if not isinstance(self.completed, bool):
+            raise TypeError(f"completed must be a bool, got {type(self.completed).__name__}")
+        if isinstance(self.duration_ms, bool) or not isinstance(self.duration_ms, int):
+            raise TypeError(
+                f"duration_ms must be an int, got {type(self.duration_ms).__name__}"
+            )
+        if self.duration_ms < 0:
+            raise ValueError(f"duration_ms must not be negative, got {self.duration_ms!r}")
+
+        # The completed/incomplete distinction is the contract's whole point,
+        # so the two states are enforced rather than merely documented.
+        if self.completed:
+            if self.error is not None:
+                raise ValueError("a completed layer must not carry an error")
+        else:
+            if self.signals:
+                raise ValueError("an incomplete layer must not carry signals")
+            if not (self.error or "").strip():
+                raise ValueError("an incomplete layer must state why it did not complete")
 
 
 @dataclass

@@ -13,6 +13,7 @@ import pytest
 
 from core.models import (
     Attachment,
+    LayerResult,
     DetectionLayer,
     DetectionSignal,
     ExtractedURL,
@@ -390,6 +391,82 @@ def test_detection_signal_rejects_non_enum_severity():
             severity="high",
             evidence="example evidence",
         )
+
+
+# --------------------------------------------------------------------------
+# LayerResult invariants
+# --------------------------------------------------------------------------
+
+
+def _layer_signal():
+    return DetectionSignal(
+        layer=DetectionLayer.L1,
+        name="example",
+        score=0.5,
+        severity=RiskLevel.MEDIUM,
+        evidence="example evidence",
+    )
+
+
+def test_layer_result_minimal_construction():
+    result = LayerResult(layer=DetectionLayer.L2, completed=True)
+
+    assert result.signals == []
+    assert result.error is None
+    assert result.duration_ms == 0
+
+
+def test_completed_layer_may_carry_signals():
+    result = LayerResult(layer=DetectionLayer.L1, completed=True, signals=[_layer_signal()])
+
+    assert len(result.signals) == 1
+
+
+def test_completed_layer_must_not_carry_an_error():
+    with pytest.raises(ValueError, match="completed layer must not carry an error"):
+        LayerResult(layer=DetectionLayer.L1, completed=True, error="timeout")
+
+
+def test_incomplete_layer_must_state_a_reason():
+    with pytest.raises(ValueError, match="did not complete"):
+        LayerResult(layer=DetectionLayer.L1, completed=False)
+
+
+@pytest.mark.parametrize("blank", ["", "   "])
+def test_incomplete_layer_rejects_a_blank_reason(blank):
+    with pytest.raises(ValueError, match="did not complete"):
+        LayerResult(layer=DetectionLayer.L1, completed=False, error=blank)
+
+
+def test_incomplete_layer_must_not_carry_signals():
+    """An abstention that also reports findings would be a contradiction."""
+    with pytest.raises(ValueError, match="must not carry signals"):
+        LayerResult(
+            layer=DetectionLayer.L1,
+            completed=False,
+            signals=[_layer_signal()],
+            error="timeout after 8s",
+        )
+
+
+def test_layer_result_rejects_a_non_enum_layer():
+    with pytest.raises(TypeError, match="layer"):
+        LayerResult(layer=1, completed=True)
+
+
+def test_layer_result_rejects_a_non_bool_completed():
+    with pytest.raises(TypeError, match="completed"):
+        LayerResult(layer=DetectionLayer.L1, completed="yes")
+
+
+def test_layer_result_rejects_a_non_int_duration():
+    with pytest.raises(TypeError, match="duration_ms"):
+        LayerResult(layer=DetectionLayer.L1, completed=True, duration_ms=12.5)
+
+
+def test_layer_result_rejects_a_negative_duration():
+    with pytest.raises(ValueError, match="duration_ms"):
+        LayerResult(layer=DetectionLayer.L1, completed=True, duration_ms=-1)
 
 
 # --------------------------------------------------------------------------
