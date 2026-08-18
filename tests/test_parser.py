@@ -431,7 +431,33 @@ def test_form_action_urls_are_extracted():
     assert _urls_by_source(email, URLSource.FORM_ACTION) == [
         "https://harvest.example.com/post"
     ]
+    
+def test_html_url_observations_preserve_document_order():
+    raw = b"""\
+Message-ID: <order@example.com>
+From: sender@example.com
+To: victim@example.org
+Subject: Interleaved URL order
+Content-Type: text/html; charset="utf-8"
 
+<html><body>
+  <img src="https://example.com/image1.png">
+  <a href="https://example.com/anchor1">First</a>
+  <form action="https://example.com/form1"></form>
+  <a href="https://example.com/anchor2">Second</a>
+  <img src="https://example.com/image2.png">
+</body></html>
+"""
+
+    email = parse_email(raw)
+
+    assert [(url.source, url.url) for url in email.urls] == [
+        (URLSource.IMG_SRC, "https://example.com/image1.png"),
+        (URLSource.ANCHOR_HREF, "https://example.com/anchor1"),
+        (URLSource.FORM_ACTION, "https://example.com/form1"),
+        (URLSource.ANCHOR_HREF, "https://example.com/anchor2"),
+        (URLSource.IMG_SRC, "https://example.com/image2.png"),
+    ]
 
 def test_non_http_and_unresolvable_hrefs_are_not_extracted():
     email = parse_email(HTML_URL_SOURCES)
