@@ -17,12 +17,16 @@ python-dotenv>=1.0
 # HTTP client (also backs the FastAPI test client)
 httpx>=0.27
 
+# Gmail ingestion (ARCHITECTURE.md section 3) - readonly scope only
+google-api-python-client>=2.100
+google-auth-httplib2>=0.2
+google-auth-oauthlib>=1.2
+
 # Tests
 pytest>=8.2
 pytest-asyncio>=0.23
 
 # Deliberately deferred until the phase that needs them:
-#   Phase 1  google-api-python-client, google-auth-oauthlib  (Gmail OAuth)
 #   Phase 2  tldextract, python-whois                        (Layer 1)
 #   Phase 2  scikit-learn, joblib, torch, transformers       (Layer 3)
 #   Phase 3  playwright, pyzbar, Pillow                      (Layer 2)
