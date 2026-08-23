@@ -19,6 +19,7 @@ action. Mapping a level onto deliver / warn / block is the later policy stage
 
 from __future__ import annotations
 
+import math
 import os
 from dataclasses import dataclass
 from pathlib import Path
@@ -43,7 +44,10 @@ __all__ = [
     "score",
 ]
 
-DEFAULT_WEIGHTS_PATH = "config/weights.yaml"
+# Resolved against the project root rather than the working directory: the
+# scorer is called from the CLI, the API and tests, and which directory the
+# process happens to be in must not decide whether the weights are found.
+DEFAULT_WEIGHTS_PATH = Path(__file__).resolve().parent.parent / "config" / "weights.yaml"
 
 
 class UnscoreableError(RuntimeError):
@@ -88,7 +92,18 @@ def load_weights(path: str | os.PathLike[str] | None = None) -> ScoringWeights:
         value = layers_section.get(layer.name.lower())
         if value is None:
             raise UnscoreableError(f"{config_path} is missing a weight for {layer.name}")
-        weight = float(value)
+        try:
+            weight = float(value)
+        except (TypeError, ValueError) as exc:
+            # A YAML string, list or mapping where a number belongs is a
+            # configuration error, not a crash to leak to the caller.
+            raise UnscoreableError(
+                f"{layer.name} weight must be a number, got {value!r}"
+            ) from exc
+        if not math.isfinite(weight):
+            # NaN and infinity survive `weight < 0` and would silently corrupt
+            # the renormalized sum, so they are rejected at load time.
+            raise UnscoreableError(f"{layer.name} weight must be finite, got {weight}")
         if weight < 0:
             raise UnscoreableError(f"{layer.name} weight must not be negative, got {weight}")
         layer_weights[layer] = weight

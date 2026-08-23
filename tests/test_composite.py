@@ -85,6 +85,40 @@ def test_malformed_config_is_rejected(tmp_path):
         load_weights(config)
 
 
+def test_default_config_is_found_from_any_working_directory(tmp_path, monkeypatch):
+    """The default path resolves against the project, not the caller's CWD."""
+    monkeypatch.chdir(tmp_path)
+
+    assert load_weights().layer_weights == WEIGHTS.layer_weights
+
+
+def weights_config(tmp_path, l1: str) -> object:
+    """A config file whose L1 weight is written verbatim as `l1`."""
+    config = tmp_path / "w.yaml"
+    config.write_text(
+        f"layers: {{l1: {l1}, l2: 0.3, l3: 0.2, l4: 0.2}}\n"
+        "thresholds: {deliver: 0.35, block: 0.65}\n"
+    )
+    return config
+
+
+@pytest.mark.parametrize("value", [".nan", ".inf", "-.inf"])
+def test_non_finite_weights_are_rejected(tmp_path, value):
+    with pytest.raises(UnscoreableError, match="finite"):
+        load_weights(weights_config(tmp_path, value))
+
+
+@pytest.mark.parametrize("value", ["not-a-number", "[0.3]", "{a: 1}"])
+def test_non_numeric_weights_are_rejected(tmp_path, value):
+    with pytest.raises(UnscoreableError, match="must be a number"):
+        load_weights(weights_config(tmp_path, value))
+
+
+def test_negative_weights_are_still_rejected(tmp_path):
+    with pytest.raises(UnscoreableError, match="negative"):
+        load_weights(weights_config(tmp_path, "-0.3"))
+
+
 # --- normal weighted scoring ----------------------------------------------
 
 
