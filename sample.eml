@@ -1,0 +1,35 @@
+From: "Microsoft Account Team" <security-noreply@account-verify-ms.example>
+To: john@example.com
+Reply-To: recovery@mail-secure.example
+Subject: Action required: unusual sign-in activity on your account
+Date: Mon, 18 Aug 2026 09:14:22 +0000
+Message-ID: <sample-phish-0001@account-verify-ms.example>
+MIME-Version: 1.0
+Content-Type: multipart/alternative; boundary="b1"
+
+--b1
+Content-Type: text/plain; charset="utf-8"
+
+We detected an unusual sign-in to your Microsoft account.
+
+Verify your identity within 24 hours or access will be suspended:
+https://account-verify-ms.example/auth?u=am9obkBleGFtcGxlLmNvbQ==
+
+Microsoft Account Team
+
+--b1
+Content-Type: text/html; charset="utf-8"
+
+<html>
+  <body>
+    <p>We detected an unusual sign-in to your Microsoft account.</p>
+    <p>
+      <a href="https://account-verify-ms.example/auth?u=am9obkBleGFtcGxlLmNvbQ==">
+        Verify your identity
+      </a>
+    </p>
+    <p>Microsoft Account Team</p>
+  </body>
+</html>
+
+--b1--
