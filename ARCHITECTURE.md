@@ -259,7 +259,9 @@ UI must render an incomplete layer as "not completed" rather than blank
 
 | Signal | Method | Expected precision |
 |---|---|---|
-| `l1.auth_fail` | Read Gmail's `Authentication-Results` header for spf/dkim/dmarc verdicts | high |
+| `l1.spf_fail` | Read the SPF verdict from `Authentication-Results` | high |
+| `l1.dkim_fail` | Read the DKIM verdict from `Authentication-Results` | high |
+| `l1.dmarc_fail` | Read the DMARC verdict from `Authentication-Results` | high |
 | `l1.replyto_mismatch` | Registrable domain of Reply-To ≠ From | high |
 | `l1.domain_age_lt_7d` | WHOIS creation date | medium |
 | `l1.display_name_impersonation` | Display name contains brand token, From domain does not | medium |
@@ -268,6 +270,23 @@ Do **not** re-verify SPF/DKIM cryptographically. Gmail already did it and
 recorded the verdict in `Authentication-Results`. Re-verification costs hours
 of work and produces a worse answer (you no longer have the original
 connecting IP).
+
+**One signal per method, not a single `l1.auth_fail`.** SPF, DKIM and DMARC
+are independent observations: a message can pass SPF, fail DKIM, and carry no
+DMARC verdict at all. An aggregate signal cannot represent that state, because
+it would have to be a finding and an abstention at once — and collapsing the
+two is exactly what section 2 forbids. Decomposing the signal keeps each
+method's verdict, evidence string and abstention separate all the way to
+scoring, where `error`-carrying signals are excluded rather than counted as a
+0.0 finding.
+
+Absence is not failure. A method with no recorded verdict abstains; so do
+`temperror`, `permerror` and any unrecognized result, because the check could
+not be completed. `none` and `neutral` are recorded benign outcomes, not
+abstentions — a domain publishing no SPF record is a fact we observed. Where
+several verdicts exist for one method (multiple DKIM signatures, or a
+prepended forged header claiming a pass), the most severe wins, so a forged
+pass cannot mask a real failure.
 
 WHOIS is rate-limited and flaky. Mandatory SQLite cache with 7-day TTL,
 keyed on registrable domain. Cache negative lookups too.
