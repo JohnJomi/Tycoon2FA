@@ -653,3 +653,69 @@ def test_constructing_a_client_performs_no_authentication(monkeypatch):
 
 def test_only_the_readonly_scope_is_requested():
     assert gmail_module.SCOPES == ["https://www.googleapis.com/auth/gmail.readonly"]
+
+
+# --------------------------------------------------------------------------
+# The resource-level surface the ingestion pipeline consumes
+# --------------------------------------------------------------------------
+
+
+def test_fetch_message_resource_returns_gmail_side_metadata():
+    """Metadata outside the RFC-822 payload must survive format='raw'."""
+    messages = FakeMessages(
+        get_result={
+            "id": "m1",
+            "threadId": "t-1",
+            "labelIds": ["INBOX", "UNREAD"],
+            "internalDate": "1740992400000",
+            "sizeEstimate": 2048,
+            "raw": _b64url(SAMPLE_EMAIL),
+        }
+    )
+
+    resource = _client(messages).fetch_message_resource("m1")
+
+    assert resource["threadId"] == "t-1"
+    assert resource["labelIds"] == ["INBOX", "UNREAD"]
+    assert resource["internalDate"] == "1740992400000"
+    assert messages.get_calls[0]["format"] == "raw"
+
+
+def test_fetch_message_resource_rejects_a_non_dict_response():
+    messages = FakeMessages(get_result=["not", "a", "resource"])
+
+    with pytest.raises(GmailClientError):
+        _client(messages).fetch_message_resource("m1")
+
+
+def test_iter_message_refs_yields_ids_and_thread_ids_across_pages():
+    messages = FakeMessages(
+        list_pages=[
+            {"messages": [{"id": "a", "threadId": "t-a"}], "nextPageToken": "p2"},
+            {"messages": [{"id": "b", "threadId": "t-b"}]},
+        ]
+    )
+
+    refs = list(_client(messages).iter_message_refs("in:anywhere"))
+
+    assert refs == [
+        {"id": "a", "threadId": "t-a"},
+        {"id": "b", "threadId": "t-b"},
+    ]
+
+
+def test_iter_message_refs_is_lazy_and_does_not_list_pages_it_is_not_asked_for():
+    messages = FakeMessages(
+        list_pages=[
+            {"messages": [{"id": "a"}], "nextPageToken": "p2"},
+            {"messages": [{"id": "b"}]},
+        ]
+    )
+
+    stream = _client(messages).iter_message_refs("in:anywhere")
+    assert next(stream) == {"id": "a", "threadId": None}
+    assert len(messages.list_calls) == 1  # page two was never requested
+
+
+def test_decode_raw_payload_is_the_public_decoder():
+    assert gmail_module.decode_raw_payload(_b64url(SAMPLE_EMAIL)) == SAMPLE_EMAIL

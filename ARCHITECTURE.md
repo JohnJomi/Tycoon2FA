@@ -250,6 +250,67 @@ UI must render an incomplete layer as "not completed" rather than blank
   `<form action>`.
 - Never fetch anything during parse. Parsing is pure and offline.
 
+`ingest/pipeline.py`
+
+The boundary between Gmail and everything downstream. Nothing above this
+module imports `googleapiclient`, knows what a page token is, or knows that
+`labelIds` is spelled in camelCase.
+
+    GmailClient -> Gmail Message resource -> parse_email() -> IngestedMessage
+
+- `GmailIngestor.ingest(query)` is a generator: listing, fetching and parsing
+  interleave, so a caller processes the first message before the last page is
+  listed and can stop early. `ingest_all` is the eager, reporting form and
+  returns an `IngestionResult`.
+- **Dedupe happens before the fetch.** A message the `SeenMessageStore` has
+  already recorded costs no Gmail round trip - which matters for quota, and
+  because `users.messages.list` legitimately repeats ids across pages when the
+  mailbox changes mid-pagination.
+- **A per-message failure is data, not an exception.** An unfetchable or
+  unparseable message becomes an `IngestionFailure` and the run continues; a
+  malformed phishing message is exactly the kind that fails to parse. A
+  *listing* failure still propagates, because a broken listing means the run
+  saw an unknown fraction of the mailbox and must not look like a clean pass.
+
+### IngestedMessage
+
+Two halves, kept distinct rather than flattened: `email` is the `ParsedEmail`
+the layers already consume, and the rest is Gmail-side metadata that exists
+only in the API resource and is *not* recoverable from the message bytes.
+
+| Field | Type | Notes |
+| --- | --- | --- |
+| `gmail_id` | `str` | Gmail's own id. Not the `Message-ID:` header - see `rfc822_message_id`. |
+| `thread_id` | `str \| None` | From the resource, falling back to the listing ref. |
+| `email` | `ParsedEmail` | Sender, recipients, subject, bodies, URLs, headers, attachment metadata. |
+| `label_ids` | `tuple[str, ...]` | `INBOX` / `SPAM` / `TRASH` exposed as `is_inbox`, `is_spam`, `is_trash`. |
+| `internal_date` | `datetime \| None` | Gmail's receipt time, UTC. Preferred over `Date:` for ordering: `Date:` is attacker-controlled. |
+| `size_estimate` | `int` | |
+| `history_id` | `str \| None` | |
+
+`auth_headers()` returns the Layer 1 authentication headers
+(`Authentication-Results`, `Received-SPF`, `DKIM-Signature`,
+`ARC-Authentication-Results`) lowercase-keyed, **all** occurrences of each
+kept - a message can carry several, and dropping the duplicates would hide
+exactly the disagreement Layer 1 looks for. An absent header is an absent key,
+so "asserted nothing" stays distinct from "asserted a blank result".
+
+### Ingestion state
+
+Persistence for ingestion state is **not yet specified**, so this module
+declines to invent a schema. Both stores are `Protocol`s with in-memory
+defaults, and are the single seam to swap when persistence is designed:
+
+- `SeenMessageStore` - `has_seen` / `mark_seen`. `InMemorySeenMessageStore` is
+  correct for one run and honest about being nothing more.
+- `Checkpoint` - `load` / `save` an epoch-seconds high-water mark. When one is
+  supplied, a later run narrows the query with Gmail's own `after:<epoch>`, so
+  the narrowing is server-side rather than a local filter. The bound overlaps
+  by its own second and the seen-store drops the re-delivered message; that is
+  the safe direction. The checkpoint advances only after the listing is walked
+  to the end, so an exception mid-run cannot leave it ahead of the messages
+  actually handed downstream.
+
 ---
 
 ## 4. Layer specifications
@@ -456,8 +517,9 @@ tycoon-detect/
 │   ├── models.py           # DetectionSignal, ParsedEmail, ExtractedURL, RiskAssessment
 │   └── orchestrator.py
 ├── ingest/
-│   ├── gmail_client.py
-│   └── parser.py
+│   ├── gmail_client.py     # OAuth + transport, format='raw'
+│   ├── parser.py           # RFC-822 -> ParsedEmail
+│   └── pipeline.py         # pagination, dedupe -> IngestedMessage
 ├── layers/
 │   ├── l1_headers.py
 │   ├── l2_urls.py
