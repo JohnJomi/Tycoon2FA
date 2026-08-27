@@ -258,6 +258,12 @@ module imports `googleapiclient`, knows what a page token is, or knows that
 
     GmailClient -> Gmail Message resource -> parse_email() -> IngestedMessage
 
+- Listing always sends `includeSpamTrash=True`. Gmail otherwise omits SPAM
+  and TRASH from any query that does not name those folders itself, which
+  would make `is_spam` / `is_trash` unreachable for an ordinary query - and
+  spam is exactly where the phishing is. Callers still narrow with their own
+  query; the flag only stops Gmail deciding for them. `max_results` is a total
+  across the listing, spent 500 at a time - Gmail's per-request cap.
 - `GmailIngestor.ingest(query)` is a generator: listing, fetching and parsing
   interleave, so a caller processes the first message before the last page is
   listed and can stop early. `ingest_all` is the eager, reporting form and

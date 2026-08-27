@@ -50,6 +50,11 @@ __all__ = [
 GMAIL_READONLY_SCOPE = "https://www.googleapis.com/auth/gmail.readonly"
 SCOPES = [GMAIL_READONLY_SCOPE]
 
+# Gmail caps `users.messages.list` at 500 results per request and silently
+# clamps anything larger, so a bigger ceiling must be spent across pages
+# rather than asked for in one call.
+MAX_RESULTS_PER_REQUEST = 500
+
 DEFAULT_CLIENT_SECRETS_FILE = ".credentials/client_secret.json"
 DEFAULT_TOKEN_FILE = ".credentials/token.json"
 
@@ -291,6 +296,17 @@ class GmailClient:
         paginating the moment it stops consuming. Pagination is followed until
         Gmail stops returning a page token or `max_results` refs have been
         yielded.
+
+        `max_results` is a total across the whole listing, not a per-request
+        value: Gmail caps `maxResults` at 500, so a larger ceiling is spent
+        500 at a time across successive pages.
+
+        `includeSpamTrash=True` is always sent. Without it Gmail omits SPAM and
+        TRASH from any query that does not name those folders itself, which
+        would make `IngestedMessage.is_spam` and `.is_trash` unreachable for an
+        ordinary query - and spam is exactly where the phishing is. The caller
+        still narrows with its own query (`in:inbox`, `-in:trash`); the flag
+        only stops Gmail from silently deciding for it.
         """
         if max_results is not None and max_results <= 0:
             return
@@ -300,11 +316,20 @@ class GmailClient:
         seen_page_tokens: set[str] = set()
 
         while True:
-            request_args: dict[str, object] = {"userId": self.user_id, "q": query}
+            request_args: dict[str, object] = {
+                "userId": self.user_id,
+                "q": query,
+                "includeSpamTrash": True,
+            }
             if page_token:
                 request_args["pageToken"] = page_token
             if max_results is not None:
-                request_args["maxResults"] = max_results - yielded
+                # `max_results - yielded` is always >= 1 here: the loop returns
+                # as soon as the ceiling is reached. Capping it keeps every
+                # request inside Gmail's 1..500 range.
+                request_args["maxResults"] = min(
+                    max_results - yielded, MAX_RESULTS_PER_REQUEST
+                )
 
             try:
                 response = self._messages().list(**request_args).execute()
