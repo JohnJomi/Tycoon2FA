@@ -60,14 +60,14 @@ Do not proceed until this works.
 Offline-first layers. Layer 3 is the project centerpiece — budget two days.
 
 ### Layer 1 (half a day)
-- [ ] Parse `Authentication-Results` for spf/dkim/dmarc verdicts
+- [x] Parse `Authentication-Results` for spf/dkim/dmarc verdicts
   - *Accept:* correctly reports pass/fail on 5 real messages. Do **not**
     re-verify cryptographically.
-- [ ] Reply-To vs From registrable-domain comparison (`tldextract`)
-- [ ] WHOIS domain age, cached, 7-day TTL, negative caching
+- [x] Reply-To vs From registrable-domain comparison (`tldextract`)
+- [x] WHOIS domain age, cached, 7-day TTL, negative caching
   - *Accept:* handles WHOIS failure by abstaining with `error` set, never by
     returning `fired=False` silently.
-- [ ] Display-name brand impersonation check
+- [x] Display-name brand impersonation check
 
 ### Layer 3 (two days) ★
 - [ ] Zero-width scan — `[\u200b\u200c\u200d\u2060\ufeff]`

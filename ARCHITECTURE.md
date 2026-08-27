@@ -364,7 +364,39 @@ prepended forged header claiming a pass), the most severe wins, so a forged
 pass cannot mask a real failure.
 
 WHOIS is rate-limited and flaky. Mandatory SQLite cache with 7-day TTL,
-keyed on registrable domain. Cache negative lookups too.
+keyed on registrable domain. Cache negative lookups too — for 6 hours, not 7
+days: not caching failures turns one rate-limited registry into a retry storm,
+while caching them for a week blinds the signal to a domain whose WHOIS was
+merely briefly down.
+
+**Interfaces.** `analyze(source, *, whois_lookup=None, cache=None, now=None)`
+runs all six signals and is what the orchestrator calls; each signal is also a
+public function of its own. `source` may be a `ParsedEmail` or an
+`IngestedMessage` — the latter is read through `auth_headers()`, ingestion's
+own accessor for the authentication headers.
+
+- `WhoisLookup` is a `Protocol` with a single `creation_date(domain) ->
+  DomainAge`, and is the layer's only network-touching seam. `PythonWhoisLookup`
+  implements it over `python-whois`, imported lazily so the unit suite never
+  needs the client installed. A lookup that raises becomes an abstention, never
+  a clean result; `whois_lookup=None` abstains for the same reason.
+- `registrable_domain()` wraps `tldextract`, configured with the bundled suffix
+  list (`suffix_list_urls=()`) so the layer never fetches, and with the PSL's
+  private section included so `attacker.github.io` and `victim.github.io` are
+  different domains.
+- `BRAND_DOMAINS` maps each known brand to the registrable domains it
+  legitimately sends from. Impersonation requires both a brand token in the
+  display name *and* that the name presents itself as the brand — either it is
+  exactly the brand, or it carries transactional service vocabulary. "Apple
+  Valley Dental" mentions a brand; it does not claim to be one. No edit
+  distance, no model, no fuzzy threshold.
+- Every signal records `metadata["fired"]`. `DetectionSignal` has no such
+  field — a finding is a non-zero score and an abstention is an `error` — but
+  stating it keeps "did this fire" answerable without re-deriving it.
+
+Graceful degradation is **per signal, not per layer**: an unavailable WHOIS
+lookup abstains on `l1.domain_age_lt_7d` alone and the other five still
+report.
 
 ### Layer 2 — URL & redirect chain
 `layers/l2_urls.py`

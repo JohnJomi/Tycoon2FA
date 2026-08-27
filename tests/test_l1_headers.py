@@ -415,3 +415,201 @@ def test_the_repository_sample_message_is_analyzed_without_error():
 
     assert len(signals) == 3
     assert all(s.error is not None for s in signals)
+
+
+# --------------------------------------------------------------------------
+# Real-message Authentication-Results fixtures
+#
+# The five REAL_* headers below were captured verbatim from real messages in
+# the mailbox the ingestion layer was validated against (only the local-part
+# of one bounce address is shortened). They are the roadmap's "correctly
+# reports pass/fail on 5 real messages" acceptance check, and they exist
+# because hand-written fixtures drift towards the shapes the parser already
+# handles - these carry real propspec ordering, real base64 with `/` and `+`
+# in it, multi-signature DKIM, and comments full of semicolons.
+#
+# Gmail rejects most hard authentication failures outright, so the failing
+# fixtures that follow are real-world *shaped* - taken from the header formats
+# Outlook/Proofpoint/Zoho emit - rather than captured from this mailbox.
+# --------------------------------------------------------------------------
+
+REAL_GITHUB = (
+    "mx.google.com; dkim=pass header.i=@github.com header.s=pf2023 "
+    'header.b="B4/Nx918"; spf=pass (google.com: domain of '
+    "notifications@github.com designates 192.30.252.143 as permitted sender) "
+    "smtp.mailfrom=notifications@github.com; dmarc=pass (p=QUARANTINE "
+    "sp=REJECT dis=NONE) header.from=github.com"
+)
+
+REAL_AMAZON_SES = (
+    "mx.google.com; dkim=pass header.i=@no-reply.hack2skill.com "
+    'header.s=qkdrj4pyxom2jekriifuhnv6ej45rhms header.b="CjN/tcuK"; '
+    "dkim=pass header.i=@amazonses.com header.s=33l4t57s6hxgsng3hsnbfahbdkoubkgb "
+    "header.b=oNLIz2He; spf=pass (google.com: domain of "
+    "010e01a04152a146-000000@ap-southeast-1.amazonses.com designates "
+    "23.251.232.54 as permitted sender) "
+    "smtp.mailfrom=010e01a04152a146-000000@ap-southeast-1.amazonses.com"
+)
+
+REAL_NOBROKER = (
+    "mx.google.com; dkim=pass header.i=@homeservices.nobroker.in header.s=kmnb1 "
+    "header.b=PLTjhYD3; spf=pass (google.com: domain of "
+    "info@homeservices.nobroker.in designates 103.162.246.221 as permitted "
+    "sender) smtp.mailfrom=info@homeservices.nobroker.in; dmarc=pass "
+    "(p=REJECT sp=REJECT dis=NONE) header.from=homeservices.nobroker.in"
+)
+
+REAL_EMARSYS = (
+    "mx.google.com; dkim=pass header.i=@hello.bitdefender.com header.s=key2 "
+    "header.b=Ch67h+5+; dkim=pass header.i=@emarsys.net "
+    "header.s=emarsys-2048b header.b=FDQIehUC; spf=pass (google.com: domain "
+    "of suite25@xpressus.emsmtp.us designates 83.68.134.99 as permitted "
+    "sender) smtp.mailfrom=suite25@xpressus.emsmtp.us; dmarc=pass "
+    "(p=REJECT sp=REJECT dis=NONE) header.from=hello.bitdefender.com"
+)
+
+REAL_SES_MANOCHA = (
+    "mx.google.com; dkim=pass header.i=@manochaacademy.com "
+    "header.s=grgopexakp5gxfpj5pymd5ju4k7akvjq header.b=NqHoeyLp; dkim=pass "
+    "header.i=@amazonses.com header.s=rlntogby6xsxlfnvyxwnvvhttakdsqto "
+    "header.b=lYvx8iow; spf=pass (google.com: domain of "
+    "0109019fbbdc2d96-000000@ses.manochaacademy.com designates 76.223.180.123 "
+    "as permitted sender) "
+    "smtp.mailfrom=0109019fbbdc2d96-000000@ses.manochaacademy.com"
+)
+
+# A genuinely captured hard failure: three DKIM signatures, the third of which
+# failed verification. Exactly the case the "most severe wins" rule exists for.
+REAL_AWS_EDUCATE = (
+    "mx.google.com; dkim=pass header.i=@awseducate.com "
+    "header.s=xelyu5nablrrqj5scckqloieecubrbgu header.b=uFVnJDDH; dkim=pass "
+    "header.i=@amazonses.com header.s=hsbnp7p3ensaochzwyq5wwmceodymuwv "
+    "header.b=S83lLXjM; dkim=fail header.i=@awseducate.com "
+    "header.s=alteducatedkimkey header.b=WrqNguPP; spf=pass (google.com: "
+    "domain of 010101a012f4697c-000000@us-west-2.amazonses.com designates "
+    "54.240.27.199 as permitted sender) "
+    "smtp.mailfrom=010101a012f4697c-000000@us-west-2.amazonses.com"
+)
+
+REAL_MESSAGES = [
+    ("github", REAL_GITHUB, {"spf": "pass", "dkim": "pass", "dmarc": "pass"}),
+    ("amazon-ses", REAL_AMAZON_SES, {"spf": "pass", "dkim": "pass"}),
+    ("nobroker", REAL_NOBROKER, {"spf": "pass", "dkim": "pass", "dmarc": "pass"}),
+    ("emarsys", REAL_EMARSYS, {"spf": "pass", "dkim": "pass", "dmarc": "pass"}),
+    ("ses-manocha", REAL_SES_MANOCHA, {"spf": "pass", "dkim": "pass"}),
+    ("aws-educate", REAL_AWS_EDUCATE, {"spf": "pass", "dkim": "fail"}),
+]
+
+
+@pytest.mark.parametrize(
+    "name,header,expected", REAL_MESSAGES, ids=[m[0] for m in REAL_MESSAGES]
+)
+def test_verdicts_on_five_real_messages(name, header, expected):
+    """The roadmap's acceptance check: pass/fail read correctly on 5 real messages."""
+    verdicts = parse_authentication_results(email_with(header))
+
+    for method, result in expected.items():
+        assert verdicts[method].result == result, f"{name}: {method}"
+
+    for signal in analyze_authentication_results(email_with(header)):
+        method = signal.metadata["method"]
+        if method in expected:
+            assert signal.error is None, f"{name}: {method} should not abstain"
+            fired = expected[method] == "fail"
+            assert signal.metadata["fired"] is fired, f"{name}: {method}"
+            assert (signal.score > 0.0) is fired, f"{name}: {method}"
+        else:
+            # A method the MTA recorded nothing for abstains rather than
+            # reporting a clean result.
+            assert signal.error is not None, f"{name}: {method} must abstain"
+
+
+def test_a_real_failed_dkim_signature_is_not_masked_by_two_passes():
+    """The real awseducate.com message signs three times; one signature fails.
+
+    Reading the first verdict would report a clean pass. The most severe wins,
+    so the failure survives - and the evidence discloses the disagreement
+    rather than resolving it silently.
+    """
+    verdicts = parse_authentication_results(email_with(REAL_AWS_EDUCATE))
+
+    assert verdicts["dkim"].all_results == ("pass", "pass", "fail")
+    assert verdicts["dkim"].result == "fail"
+    assert verdicts["dkim"].failed is True
+
+    signal = signals_by_method(email_with(REAL_AWS_EDUCATE))["dkim"]
+    assert signal.score > 0.0
+    assert signal.metadata["fired"] is True
+    assert "pass, pass, fail" in signal.evidence
+
+
+def test_a_real_multi_signature_message_keeps_every_dkim_verdict():
+    verdicts = parse_authentication_results(email_with(REAL_AMAZON_SES))
+
+    assert verdicts["dkim"].all_results == ("pass", "pass")
+    assert verdicts["dkim"].authserv_id == "mx.google.com"
+
+
+def test_real_headers_are_traceable_to_the_reporting_mta():
+    for _name, header, _expected in REAL_MESSAGES:
+        verdicts = parse_authentication_results(email_with(header))
+        assert all(v.authserv_id == "mx.google.com" for v in verdicts.values())
+
+
+# Real-world *shaped* failures. Gmail rarely delivers a hard fail, so these
+# reproduce the header formats other MTAs emit rather than being captured.
+REAL_SHAPED_FAILURES = [
+    (
+        "outlook-spf-fail",
+        "spf=fail (sender IP is 45.155.205.13) "
+        "smtp.mailfrom=paypa1-secure.top; dkim=none (message not signed) "
+        "header.d=none; dmarc=fail action=oreject header.from=paypa1-secure.top;"
+        "compauth=fail reason=000",
+        {"spf": "fail", "dkim": "none", "dmarc": "fail"},
+    ),
+    (
+        "proofpoint-dkim-fail",
+        "mx1.example.net; dkim=fail reason=\"signature verification failed\" "
+        "header.d=chase.com header.b=Qk3Lm9; spf=softfail "
+        "smtp.mailfrom=bounce@mailer.example.ru; dmarc=fail (p=reject) "
+        "header.from=chase.com",
+        {"spf": "softfail", "dkim": "fail", "dmarc": "fail"},
+    ),
+    (
+        "zoho-temperror",
+        "mx.zohomail.com; spf=temperror (DNS timeout) "
+        "smtp.mailfrom=alerts@corp.example; dkim=permerror (bad key record) "
+        "header.i=@corp.example",
+        {"spf": "temperror", "dkim": "permerror"},
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    "name,header,expected", REAL_SHAPED_FAILURES, ids=[m[0] for m in REAL_SHAPED_FAILURES]
+)
+def test_failing_real_world_shaped_headers_are_read_correctly(name, header, expected):
+    verdicts = parse_authentication_results(email_with(header))
+
+    for method, result in expected.items():
+        assert verdicts[method].result == result, f"{name}: {method}"
+
+
+def test_a_hard_failure_scores_and_an_inconclusive_one_abstains():
+    signals = signals_by_method(email_with(REAL_SHAPED_FAILURES[1][1]))
+
+    assert signals["dmarc"].score > 0.0
+    assert signals["dmarc"].error is None
+    assert signals["dmarc"].metadata["fired"] is True
+
+    inconclusive = signals_by_method(email_with(REAL_SHAPED_FAILURES[2][1]))
+    assert inconclusive["spf"].score == 0.0
+    assert inconclusive["spf"].error is not None
+    assert inconclusive["spf"].metadata["fired"] is False
+
+
+def test_a_message_with_no_authentication_results_abstains_on_every_method():
+    signals = signals_by_method(email_with())
+
+    assert set(signals) == set(AUTH_METHODS)
+    assert all(s.error is not None and s.score == 0.0 for s in signals.values())
