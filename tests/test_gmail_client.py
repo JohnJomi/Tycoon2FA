@@ -653,3 +653,158 @@ def test_constructing_a_client_performs_no_authentication(monkeypatch):
 
 def test_only_the_readonly_scope_is_requested():
     assert gmail_module.SCOPES == ["https://www.googleapis.com/auth/gmail.readonly"]
+
+
+# --------------------------------------------------------------------------
+# The resource-level surface the ingestion pipeline consumes
+# --------------------------------------------------------------------------
+
+
+def test_fetch_message_resource_returns_gmail_side_metadata():
+    """Metadata outside the RFC-822 payload must survive format='raw'."""
+    messages = FakeMessages(
+        get_result={
+            "id": "m1",
+            "threadId": "t-1",
+            "labelIds": ["INBOX", "UNREAD"],
+            "internalDate": "1740992400000",
+            "sizeEstimate": 2048,
+            "raw": _b64url(SAMPLE_EMAIL),
+        }
+    )
+
+    resource = _client(messages).fetch_message_resource("m1")
+
+    assert resource["threadId"] == "t-1"
+    assert resource["labelIds"] == ["INBOX", "UNREAD"]
+    assert resource["internalDate"] == "1740992400000"
+    assert messages.get_calls[0]["format"] == "raw"
+
+
+def test_fetch_message_resource_rejects_a_non_dict_response():
+    messages = FakeMessages(get_result=["not", "a", "resource"])
+
+    with pytest.raises(GmailClientError):
+        _client(messages).fetch_message_resource("m1")
+
+
+def test_iter_message_refs_yields_ids_and_thread_ids_across_pages():
+    messages = FakeMessages(
+        list_pages=[
+            {"messages": [{"id": "a", "threadId": "t-a"}], "nextPageToken": "p2"},
+            {"messages": [{"id": "b", "threadId": "t-b"}]},
+        ]
+    )
+
+    refs = list(_client(messages).iter_message_refs("in:anywhere"))
+
+    assert refs == [
+        {"id": "a", "threadId": "t-a"},
+        {"id": "b", "threadId": "t-b"},
+    ]
+
+
+def test_iter_message_refs_is_lazy_and_does_not_list_pages_it_is_not_asked_for():
+    messages = FakeMessages(
+        list_pages=[
+            {"messages": [{"id": "a"}], "nextPageToken": "p2"},
+            {"messages": [{"id": "b"}]},
+        ]
+    )
+
+    stream = _client(messages).iter_message_refs("in:anywhere")
+    assert next(stream) == {"id": "a", "threadId": None}
+    assert len(messages.list_calls) == 1  # page two was never requested
+
+
+def test_decode_raw_payload_is_the_public_decoder():
+    assert gmail_module.decode_raw_payload(_b64url(SAMPLE_EMAIL)) == SAMPLE_EMAIL
+
+
+# --------------------------------------------------------------------------
+# Gmail's 500-per-request ceiling, and Spam/Trash visibility
+# --------------------------------------------------------------------------
+
+
+def _page(count: int, *, token: str | None = None, start: int = 0) -> dict:
+    page: dict = {"messages": [{"id": f"m{start + i}"} for i in range(count)]}
+    if token is not None:
+        page["nextPageToken"] = token
+    return page
+
+
+def test_a_ceiling_at_the_gmail_limit_is_requested_in_one_call():
+    messages = FakeMessages(list_pages=[_page(500)])
+
+    refs = list(_client(messages).iter_message_refs("in:anywhere", max_results=500))
+
+    assert len(refs) == 500
+    assert [c["maxResults"] for c in messages.list_calls] == [500]
+
+
+def test_a_ceiling_above_the_gmail_limit_is_spent_across_requests():
+    messages = FakeMessages(
+        list_pages=[_page(500, token="p2"), _page(500, token="p3", start=500)]
+    )
+
+    refs = list(_client(messages).iter_message_refs("in:anywhere", max_results=1000))
+
+    assert len(refs) == 1000
+    # Never above 500, and the second request asks for the remaining 500.
+    assert [c["maxResults"] for c in messages.list_calls] == [500, 500]
+
+
+def test_the_final_request_asks_only_for_the_remainder():
+    messages = FakeMessages(
+        list_pages=[_page(500, token="p2"), _page(1, start=500)]
+    )
+
+    refs = list(_client(messages).iter_message_refs("in:anywhere", max_results=501))
+
+    assert len(refs) == 501
+    assert [c["maxResults"] for c in messages.list_calls] == [500, 1]
+
+
+def test_a_ceiling_below_the_gmail_limit_is_passed_through_unchanged():
+    messages = FakeMessages(list_pages=[_page(100)])
+
+    list(_client(messages).iter_message_refs("in:anywhere", max_results=100))
+
+    assert messages.list_calls[0]["maxResults"] == 100
+
+
+def test_no_ceiling_leaves_max_results_to_gmail():
+    messages = FakeMessages(list_pages=[{"messages": [{"id": "a"}]}])
+
+    list(_client(messages).iter_message_refs("in:anywhere"))
+
+    assert "maxResults" not in messages.list_calls[0]
+
+
+def test_a_non_positive_ceiling_still_makes_no_request():
+    messages = FakeMessages(list_pages=[_page(5)])
+
+    assert list(_client(messages).iter_message_refs("in:anywhere", max_results=0)) == []
+    assert messages.list_calls == []
+
+
+def test_listing_asks_gmail_to_include_spam_and_trash():
+    """Without the flag Gmail omits SPAM and TRASH from a query that does not
+    name them, which would make is_spam/is_trash unreachable - and spam is
+    exactly where the phishing is."""
+    messages = FakeMessages(list_pages=[{"messages": [{"id": "a"}]}])
+
+    list(_client(messages).iter_message_refs(""))
+
+    assert messages.list_calls[0]["includeSpamTrash"] is True
+
+
+def test_every_page_of_a_listing_includes_spam_and_trash():
+    messages = FakeMessages(
+        list_pages=[{"messages": [{"id": "a"}], "nextPageToken": "p2"},
+                    {"messages": [{"id": "b"}]}]
+    )
+
+    list(_client(messages).list_message_ids("in:anywhere"))
+
+    assert [c["includeSpamTrash"] for c in messages.list_calls] == [True, True]

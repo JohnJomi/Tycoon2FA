@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import base64
 import os
+from collections.abc import Iterator
 from pathlib import Path
 
 from google.auth.transport.requests import Request
@@ -38,11 +39,21 @@ from googleapiclient.discovery import build
 from core.models import ParsedEmail
 from ingest.parser import parse_email
 
-__all__ = ["GmailClient", "GmailClientError", "GMAIL_READONLY_SCOPE"]
+__all__ = [
+    "GmailClient",
+    "GmailClientError",
+    "GMAIL_READONLY_SCOPE",
+    "decode_raw_payload",
+]
 
 # Read-only, and deliberately the only scope this project ever requests.
 GMAIL_READONLY_SCOPE = "https://www.googleapis.com/auth/gmail.readonly"
 SCOPES = [GMAIL_READONLY_SCOPE]
+
+# Gmail caps `users.messages.list` at 500 results per request and silently
+# clamps anything larger, so a bigger ceiling must be spent across pages
+# rather than asked for in one call.
+MAX_RESULTS_PER_REQUEST = 500
 
 DEFAULT_CLIENT_SECRETS_FILE = ".credentials/client_secret.json"
 DEFAULT_TOKEN_FILE = ".credentials/token.json"
@@ -78,6 +89,12 @@ def _decode_raw(raw: str | bytes) -> bytes:
         return base64.b64decode(raw + padding, altchars=b"-_", validate=True)
     except Exception as exc:  # noqa: BLE001 - malformed payload from Gmail
         raise GmailClientError("Gmail returned a raw payload that is not valid base64url") from exc
+
+
+# Public name for the payload decoder. The ingestion pipeline decodes the same
+# base64url field from the same resource, and must not reimplement the strict
+# decoding rules above.
+decode_raw_payload = _decode_raw
 
 
 class GmailClient:
@@ -211,8 +228,19 @@ class GmailClient:
     def _messages(self):  # noqa: ANN202 - Google's resource objects are untyped
         return self.service().users().messages()
 
-    def fetch_raw(self, message_id: str) -> bytes:
-        """Raw RFC-822 bytes for one message, via ``format='raw'``."""
+    def fetch_message_resource(self, message_id: str) -> dict:
+        """The full Gmail ``Message`` resource for one message, ``format='raw'``.
+
+        Returned as Gmail gave it, so the caller keeps the Gmail-side metadata
+        that lives *outside* the RFC-822 payload - ``threadId``, ``labelIds``,
+        ``internalDate``, ``sizeEstimate`` - alongside the ``raw`` field. That
+        metadata exists only in the API resource; it is not recoverable from
+        the message bytes, which is why the whole resource is surfaced rather
+        than just the payload.
+
+        Still ``format='raw'`` per ARCHITECTURE.md section 3: this adds no
+        second round trip and no ``format='full'`` fidelity loss.
+        """
         try:
             message = (
                 self._messages()
@@ -224,7 +252,17 @@ class GmailClient:
         except Exception as exc:  # noqa: BLE001 - HttpError and transport faults
             raise GmailClientError(f"could not fetch Gmail message {message_id}") from exc
 
-        raw = message.get("raw") if isinstance(message, dict) else None
+        if not isinstance(message, dict):
+            raise GmailClientError(
+                f"Gmail returned an unexpected response for message {message_id}"
+            )
+        return message
+
+    def fetch_raw(self, message_id: str) -> bytes:
+        """Raw RFC-822 bytes for one message, via ``format='raw'``."""
+        message = self.fetch_message_resource(message_id)
+
+        raw = message.get("raw")
         if not raw:
             raise GmailClientError(
                 f"Gmail message {message_id} came back without a raw payload"
@@ -244,28 +282,54 @@ class GmailClient:
 
     # ------------------------------------------------------------- listing
 
-    def list_message_ids(self, query: str, *, max_results: int | None = None) -> list[str]:
-        """Message ids matching a caller-supplied Gmail search query.
+    def iter_message_refs(
+        self, query: str, *, max_results: int | None = None
+    ) -> Iterator[dict]:
+        """Stream `{"id", "threadId"}` refs for a Gmail search query.
 
-        The query is always the caller's - nothing is hardcoded here. Only ids
-        are requested: `users.messages.list` returns ids and thread ids, never
-        bodies, so listing an inbox does not download any mail. Pagination is
-        followed until Gmail stops returning a page token or `max_results` is
-        reached.
+        The query is always the caller's - nothing is hardcoded here. Only
+        refs are requested: `users.messages.list` returns ids and thread ids,
+        never bodies, so listing an inbox downloads no mail.
+
+        A generator rather than a list, so a caller ingesting a large mailbox
+        starts work on page one instead of waiting for every page, and stops
+        paginating the moment it stops consuming. Pagination is followed until
+        Gmail stops returning a page token or `max_results` refs have been
+        yielded.
+
+        `max_results` is a total across the whole listing, not a per-request
+        value: Gmail caps `maxResults` at 500, so a larger ceiling is spent
+        500 at a time across successive pages.
+
+        `includeSpamTrash=True` is always sent. Without it Gmail omits SPAM and
+        TRASH from any query that does not name those folders itself, which
+        would make `IngestedMessage.is_spam` and `.is_trash` unreachable for an
+        ordinary query - and spam is exactly where the phishing is. The caller
+        still narrows with its own query (`in:inbox`, `-in:trash`); the flag
+        only stops Gmail from silently deciding for it.
         """
         if max_results is not None and max_results <= 0:
-            return []
+            return
 
-        message_ids: list[str] = []
+        yielded = 0
         page_token: str | None = None
         seen_page_tokens: set[str] = set()
 
         while True:
-            request_args: dict[str, object] = {"userId": self.user_id, "q": query}
+            request_args: dict[str, object] = {
+                "userId": self.user_id,
+                "q": query,
+                "includeSpamTrash": True,
+            }
             if page_token:
                 request_args["pageToken"] = page_token
             if max_results is not None:
-                request_args["maxResults"] = max_results - len(message_ids)
+                # `max_results - yielded` is always >= 1 here: the loop returns
+                # as soon as the ceiling is reached. Capping it keeps every
+                # request inside Gmail's 1..500 range.
+                request_args["maxResults"] = min(
+                    max_results - yielded, MAX_RESULTS_PER_REQUEST
+                )
 
             try:
                 response = self._messages().list(**request_args).execute()
@@ -282,20 +346,31 @@ class GmailClient:
                 )
 
             for message in response.get("messages") or []:
-                message_id = message.get("id") if isinstance(message, dict) else None
-                if message_id:
-                    message_ids.append(message_id)
-                    if max_results is not None and len(message_ids) >= max_results:
-                        return message_ids
+                if not isinstance(message, dict):
+                    continue
+                message_id = message.get("id")
+                if not message_id:
+                    continue
+                yield {"id": message_id, "threadId": message.get("threadId")}
+                yielded += 1
+                if max_results is not None and yielded >= max_results:
+                    return
 
             page_token = response.get("nextPageToken")
             if not page_token:
-                break
+                return
             if page_token in seen_page_tokens:
                 # Gmail handed back a token we have already followed. Without
                 # a max_results ceiling that would loop forever, so stop with
                 # what we have rather than spinning.
-                break
+                return
             seen_page_tokens.add(page_token)
 
-        return message_ids
+    def list_message_ids(self, query: str, *, max_results: int | None = None) -> list[str]:
+        """Message ids matching a caller-supplied Gmail search query.
+
+        The eager, ids-only view of `iter_message_refs`, kept because callers
+        that just want a bounded id list should not have to think about
+        generators.
+        """
+        return [ref["id"] for ref in self.iter_message_refs(query, max_results=max_results)]
