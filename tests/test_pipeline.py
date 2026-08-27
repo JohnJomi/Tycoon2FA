@@ -421,7 +421,25 @@ def test_a_later_run_narrows_the_query_with_the_checkpoint():
 
     list(GmailIngestor(client, checkpoint=checkpoint).ingest("in:inbox"))
 
-    assert client.queries == ["in:inbox after:1740992400"]
+    assert client.queries == ["(in:inbox) after:1740992400"]
+
+
+def test_a_caller_query_with_a_top_level_or_is_grouped_before_the_bound():
+    """Gmail's OR binds looser than the implicit AND between terms.
+
+    Unparenthesized, `in:spam OR in:inbox after:N` reads as "spam, or
+    inbox-since-N": the bound never applies to the first branch, and every
+    incremental run re-ingests the whole of it.
+    """
+    client = FakeClient(pages=[[]], resources={})
+
+    list(
+        GmailIngestor(client, checkpoint=InMemoryCheckpoint(1740992400)).ingest(
+            "in:spam OR in:inbox"
+        )
+    )
+
+    assert client.queries == ["(in:spam OR in:inbox) after:1740992400"]
 
 
 def test_the_checkpoint_bound_is_the_whole_query_when_none_was_given():
@@ -508,7 +526,39 @@ def test_a_corrupt_base64_payload_is_a_failure_not_a_crash():
     assert result.failures[0].reason == "the message could not be fetched from Gmail"
 
 
+def test_a_transport_failure_leaves_the_message_unseen_so_it_can_be_retried():
+    """A GmailClientError is a property of the call, not of the message.
+
+    A timeout, a 429 or a 5xx says nothing about whether the message is
+    ingestible, so marking it seen would suppress a message the mailbox still
+    holds - permanently, on the strength of one bad minute.
+    """
+    resources = {"m1": _resource("m1", PLAIN_EMAIL)}
+    client = FakeClient(
+        pages=[[{"id": "m1"}]],
+        resources=resources,
+        get_errors={"m1": GmailClientError("rate limit exceeded")},
+    )
+    store = InMemorySeenMessageStore()
+    ingestor = GmailIngestor(client, seen_store=store)
+
+    first = ingestor.ingest_all()
+
+    assert first.messages == []
+    assert first.failures[0].gmail_id == "m1"
+    assert store.has_seen("m1") is False
+
+    # Gmail recovers; the same ingestor picks the message up on the next run.
+    client._get_errors.clear()
+    second = ingestor.ingest_all()
+
+    assert [m.gmail_id for m in second.messages] == ["m1"]
+    assert second.failures == []
+    assert client.fetched == ["m1", "m1"]
+
+
 def test_a_failed_message_is_not_retried_within_the_same_ingestor():
+    """A parse failure *is* a property of the message, so it is marked seen."""
     client = FakeClient(
         pages=[[{"id": "bad"}]],
         resources={},

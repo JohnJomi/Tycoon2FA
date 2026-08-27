@@ -271,6 +271,11 @@ module imports `googleapiclient`, knows what a page token is, or knows that
   malformed phishing message is exactly the kind that fails to parse. A
   *listing* failure still propagates, because a broken listing means the run
   saw an unknown fraction of the mailbox and must not look like a clean pass.
+- **Only permanent failures are marked seen.** A parse failure is a property
+  of the message and will recur identically, so marking it seen stops a
+  permanent retry loop. A `GmailClientError` is a property of the *call* - a
+  timeout, a 429, a 5xx - and is left unseen, so a later run retries it rather
+  than suppressing a live message on the strength of one bad minute.
 
 ### IngestedMessage
 
@@ -305,9 +310,12 @@ defaults, and are the single seam to swap when persistence is designed:
   correct for one run and honest about being nothing more.
 - `Checkpoint` - `load` / `save` an epoch-seconds high-water mark. When one is
   supplied, a later run narrows the query with Gmail's own `after:<epoch>`, so
-  the narrowing is server-side rather than a local filter. The bound overlaps
-  by its own second and the seen-store drops the re-delivered message; that is
-  the safe direction. The checkpoint advances only after the listing is walked
+  the narrowing is server-side rather than a local filter. The caller's query
+  is parenthesized first: Gmail's `OR` binds looser than the implicit `AND`,
+  so a bare `in:spam OR in:inbox after:N` would mean "spam, or
+  inbox-since-N" and the bound would never reach the first branch. The bound
+  overlaps by its own second and the seen-store drops the re-delivered
+  message; that is the safe direction. The checkpoint advances only after the listing is walked
   to the end, so an exception mid-run cannot leave it ahead of the messages
   actually handed downstream.
 

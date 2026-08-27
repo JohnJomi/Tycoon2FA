@@ -356,6 +356,12 @@ class GmailIngestor:
         message can come back once more; the seen-store drops it. Overlapping
         by a second is the safe direction: the alternative risks skipping a
         message that arrived in the same second as the checkpoint.
+
+        The caller's query is parenthesized before the bound is appended.
+        Gmail's `OR` binds looser than the implicit `AND` between terms, so a
+        bare `in:spam OR in:inbox after:N` means "spam, or inbox-since-N" - the
+        bound silently fails to apply to the first branch and the run re-ingests
+        the whole of it. `(in:spam OR in:inbox) after:N` is what was meant.
         """
         if self.checkpoint is None:
             return query
@@ -363,7 +369,7 @@ class GmailIngestor:
         if since is None:
             return query
         bound = f"after:{max(int(since), 0)}"
-        return f"{query} {bound}".strip() if query.strip() else bound
+        return f"({query.strip()}) {bound}" if query.strip() else bound
 
     # ----------------------------------------------------------- ingestion
 
@@ -438,9 +444,16 @@ class GmailIngestor:
                             gmail_id=gmail_id, reason=_failure_reason(exc), error=exc
                         )
                     )
-                # Marked seen regardless: retrying a message that is
-                # structurally unparseable just fails identically next run.
-                self.seen_store.mark_seen(gmail_id)
+                # Whether the message is marked seen turns on whether the
+                # failure can ever resolve itself. A parse failure is a
+                # property of the message: it will fail identically next run,
+                # so marking it seen stops a permanent retry loop. A
+                # GmailClientError is a property of the *call* - a timeout, a
+                # 429, a 5xx - and marking it seen would suppress a message
+                # the mailbox still holds, permanently, on the strength of one
+                # bad minute. It is left unseen so a later run retries it.
+                if not isinstance(exc, GmailClientError):
+                    self.seen_store.mark_seen(gmail_id)
                 continue
 
             self.seen_store.mark_seen(gmail_id)
