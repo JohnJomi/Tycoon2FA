@@ -3,6 +3,12 @@
 Deterministic and offline: every layer used here is a small async double, and
 no test touches the network, Gmail or OAuth. Timeouts are shrunk to
 milliseconds so the suite stays fast.
+
+Layer 1 is now the real implementation rather than a stub, so the tests that
+exercise `run_layers` with its default mapping would otherwise reach a
+registry. The autouse `offline_layer_one` fixture below removes both of Layer
+1's ambient dependencies - the WHOIS client and the on-disk cache - for every
+test in this module. Nothing here opens a socket.
 """
 
 from __future__ import annotations
@@ -16,11 +22,28 @@ from core.models import DetectionLayer, DetectionSignal, LayerResult, ParsedEmai
 from core.orchestrator import (
     DEFAULT_LAYER_TIMEOUTS,
     DEFAULT_TOTAL_TIMEOUT,
-    STUB_L1_SIGNAL_NAME,
     run_layers,
 )
+from layers import l1_headers
 
 ALL_LAYERS = [DetectionLayer.L1, DetectionLayer.L2, DetectionLayer.L3, DetectionLayer.L4]
+
+# The six signals Layer 1 always emits, in ARCHITECTURE.md section 4 order.
+L1_SIGNAL_NAMES = [
+    "spf_fail",
+    "dkim_fail",
+    "dmarc_fail",
+    "replyto_mismatch",
+    "domain_age_lt_7d",
+    "display_name_impersonation",
+]
+
+
+@pytest.fixture(autouse=True)
+def offline_layer_one(monkeypatch):
+    """Keep the default Layer 1 off the network and off the disk."""
+    monkeypatch.setattr(l1_headers, "default_whois_lookup", lambda: None)
+    monkeypatch.setattr(l1_headers, "default_cache", lambda: None)
 
 
 @pytest.fixture
@@ -169,33 +192,39 @@ async def test_layers_overlap_in_time(email):
 
 
 @pytest.mark.asyncio
-async def test_default_l1_stub_returns_its_hardcoded_signal(email):
+async def test_default_l1_runs_the_real_layer_one_implementation(email):
     results = _by_layer(await run_layers(email))
     l1 = results[DetectionLayer.L1]
 
     assert l1.completed is True
-    assert len(l1.signals) == 1
-    assert l1.signals[0].name == STUB_L1_SIGNAL_NAME
-    assert l1.signals[0].layer is DetectionLayer.L1
+    assert [s.name for s in l1.signals] == L1_SIGNAL_NAMES
+    assert all(s.layer is DetectionLayer.L1 for s in l1.signals)
 
 
 @pytest.mark.asyncio
-async def test_l1_stub_signal_is_marked_as_a_stub_not_a_real_detection(email):
+async def test_default_l1_emits_no_stub_signal(email):
+    """The Phase 1 placeholder is gone; every signal is a real detection."""
     results = _by_layer(await run_layers(email))
-    signal = results[DetectionLayer.L1].signals[0]
 
-    assert "STUB" in signal.evidence.upper()
-    assert signal.metadata.get("stub") is True
+    for signal in results[DetectionLayer.L1].signals:
+        assert "STUB" not in signal.evidence.upper()
+        assert signal.metadata.get("stub") is not True
 
 
 @pytest.mark.asyncio
-async def test_default_l2_l3_l4_stubs_complete_with_no_signals(email):
+async def test_default_l2_l3_l4_report_themselves_as_unimplemented(email):
+    """An unwritten layer must not look like a layer that ran and found nothing.
+
+    `completed=True` with no signals is a claim of innocence that scoring counts
+    at the layer's full weight; `completed=False` means "no information" and
+    gets its weight redistributed onto the layers that did run.
+    """
     results = _by_layer(await run_layers(email))
 
     for layer in (DetectionLayer.L2, DetectionLayer.L3, DetectionLayer.L4):
-        assert results[layer].completed is True
+        assert results[layer].completed is False
         assert results[layer].signals == []
-        assert results[layer].error is None
+        assert "not implemented" in results[layer].error
 
 
 @pytest.mark.asyncio
@@ -438,8 +467,11 @@ async def test_a_none_returning_layer_does_not_stop_the_others(email):
     results = _by_layer(await run_layers(email, layers={DetectionLayer.L2: returns_none}))
 
     assert results[DetectionLayer.L2].completed is False
-    for layer in (DetectionLayer.L1, DetectionLayer.L3, DetectionLayer.L4):
-        assert results[layer].completed is True
+    # L1 is real and still ran. L3/L4 are unwritten and report that - a
+    # different reason from L2's, but neither stopped the others.
+    assert results[DetectionLayer.L1].completed is True
+    for layer in (DetectionLayer.L3, DetectionLayer.L4):
+        assert "not implemented" in results[layer].error
 
 
 @pytest.mark.asyncio
@@ -451,10 +483,11 @@ async def test_partial_custom_layer_mapping_still_runs_all_four_layers(email):
 
     assert [r.layer for r in results] == ALL_LAYERS
     assert results[1].signals[0].name == "custom"
-    # The untouched defaults still ran.
-    assert results[0].signals[0].name == STUB_L1_SIGNAL_NAME
-    assert results[2].completed is True and results[2].signals == []
-    assert results[3].completed is True and results[3].signals == []
+    # The untouched defaults still ran: L1 produced its signals, and the
+    # unwritten layers reported themselves rather than being skipped.
+    assert [s.name for s in results[0].signals] == L1_SIGNAL_NAMES
+    assert results[2].completed is False and "not implemented" in results[2].error
+    assert results[3].completed is False and "not implemented" in results[3].error
 
 
 # --------------------------------------------------------------------------

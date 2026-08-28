@@ -1,9 +1,11 @@
 """Unit tests for the `python -m cli analyze` entry point.
 
-Offline and deterministic: the pipeline the CLI calls is the Phase 1 one, with
-stub layers, so nothing here touches the network, Gmail or OAuth. Scope is the
-CLI's own job - input validation, pipeline invocation, output and exit status -
-not the pipeline's behaviour, which its own tests already cover.
+Offline and deterministic. Layer 1 is now real, but the sample message sends
+from `.invalid` - which has no registrable domain - so its WHOIS signal
+abstains before any lookup is attempted and nothing here touches the network,
+Gmail or OAuth. Scope is the CLI's own job - input validation, pipeline
+invocation, output and exit status - not the pipeline's behaviour, which its
+own tests already cover.
 """
 
 from __future__ import annotations
@@ -53,8 +55,9 @@ def test_analyze_prints_the_message_and_its_signals(eml, capsys):
 
     assert "<cli-test-0001@example.invalid>" in out
     assert "Unusual sign-in activity" in out
-    # The Phase 1 stub L1 fires exactly one signal; it must be reported.
-    assert "L1/orchestrator_stub" in out
+    # Layer 1's signals are reported under their qualified names.
+    assert "L1/replyto_mismatch" in out
+    assert "L1/display_name_impersonation" in out
 
 
 def test_analyze_reports_every_layer_status(eml, capsys):

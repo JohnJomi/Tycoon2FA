@@ -16,12 +16,12 @@ way to scoring, because collapsing them turns an outage into an all-clear.
 Scope: this module runs layers and reports what happened. It does not score,
 does not decide a verdict, and does not know what any layer looks for.
 
-TEMPORARY SCAFFOLD
-------------------
-The real detection layers do not exist yet. The stubs at the bottom of this
-module stand in for them so the orchestration path can be exercised end to
-end. They perform **no detection whatsoever** and are replaced by the real
-`layers/` implementations in Phase 2.
+Layer 1 is real: `DEFAULT_LAYERS` points at `layers.l1_headers.analyze_async`,
+which is the layer's own async adapter. Layers 2-4 are not written yet, and
+say so: they report `completed=False`, which is the same state a timeout
+produces and means "no information", not "nothing found". Scoring then
+redistributes their weight onto the layers that did run, so an unwritten layer
+cannot dilute a real finding.
 """
 
 from __future__ import annotations
@@ -30,12 +30,14 @@ import asyncio
 import time
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 
-from core.models import DetectionLayer, DetectionSignal, LayerResult, ParsedEmail, RiskLevel
+from core.models import DetectionLayer, DetectionSignal, LayerResult, ParsedEmail
+from layers import l1_headers
 
 __all__ = [
+    "DEFAULT_LAYERS",
+    "unimplemented_layer",
     "DEFAULT_LAYER_TIMEOUTS",
     "DEFAULT_TOTAL_TIMEOUT",
-    "STUB_L1_SIGNAL_NAME",
     "LayerCallable",
     "run_layers",
 ]
@@ -57,9 +59,6 @@ DEFAULT_LAYER_TIMEOUTS: Mapping[DetectionLayer, float] = {
 # Wall-clock cap on the whole gather. A backstop only: every per-layer timeout
 # is strictly below it, so it fires only if a layer refuses to be cancelled.
 DEFAULT_TOTAL_TIMEOUT = 20.0
-
-STUB_L1_SIGNAL_NAME = "orchestrator_stub"
-
 
 def _elapsed_ms(started: float) -> int:
     """Milliseconds since a perf_counter start, never negative."""
@@ -188,40 +187,50 @@ async def run_layers(
 
 
 # --------------------------------------------------------------------------
-# TEMPORARY LAYER STUBS - scaffolding for Phase 1 only
+# The layer mapping
 #
-# These are not detectors. They exist so the orchestration path can be tested
-# before layers/ is implemented, and they are deleted once the real layers
-# land in Phase 2. None of them looks at the email at all.
+# L1 is the real implementation. L2-L4 are not written yet.
+#
+# An unwritten layer must not return `[]`. A layer that completes with no
+# signals is making a claim - "I ran, and I found nothing" - and scoring counts
+# that claim as a genuine 0.0 at the layer's full configured weight. With three
+# unwritten layers carrying 0.70 of the weight between them, a Layer 1 DMARC
+# failure scoring 0.85 came out as a 0.255 composite: LOW, for a message whose
+# authentication genuinely failed.
+#
+# `completed=False` is the state ARCHITECTURE.md section 2 already provides for
+# exactly this - it is what a timeout produces, and it means "no information".
+# `scoring.composite` then redistributes the weight across the layers that did
+# run, so the same message scores 0.85 and reads HIGH. Raising is how a
+# LayerCallable reports that it could not produce signals, so this needs no new
+# vocabulary in either module.
 # --------------------------------------------------------------------------
 
 
-async def stub_l1(email: ParsedEmail) -> list[DetectionSignal]:
-    """Return one hardcoded placeholder signal. Performs no detection."""
-    return [
-        DetectionSignal(
-            layer=DetectionLayer.L1,
-            name=STUB_L1_SIGNAL_NAME,
-            score=0.5,
-            severity=RiskLevel.MEDIUM,
-            evidence=(
-                "TEMPORARY STUB: hardcoded placeholder emitted by "
-                "core/orchestrator.py. No header, domain or authentication "
-                "check has been performed."
-            ),
-            metadata={"stub": True},
+def unimplemented_layer(layer: DetectionLayer, description: str) -> LayerCallable:
+    """A layer that has not been written, and reports itself as such.
+
+    Not a stub that returns nothing: that would be indistinguishable from a
+    layer that ran and found the message clean.
+    """
+
+    async def run(email: ParsedEmail) -> list[DetectionSignal]:
+        raise NotImplementedError(
+            f"{layer.name} ({description}) is not implemented yet"
         )
-    ]
+
+    run.__name__ = f"unimplemented_{layer.name.lower()}"
+    run.__qualname__ = run.__name__
+    return run
 
 
-async def stub_empty(email: ParsedEmail) -> list[DetectionSignal]:
-    """Complete with no signals. A genuine negative, not an abstention."""
-    return []
-
-
+# `analyze_async` is Layer 1's own adapter onto LayerCallable, and every
+# argument beyond the email defaults: the WHOIS client, its timeout and the
+# shared cache are the layer's decisions, not the orchestrator's. This module
+# still knows nothing about what any layer looks for.
 DEFAULT_LAYERS: Mapping[DetectionLayer, LayerCallable] = {
-    DetectionLayer.L1: stub_l1,
-    DetectionLayer.L2: stub_empty,
-    DetectionLayer.L3: stub_empty,
-    DetectionLayer.L4: stub_empty,
+    DetectionLayer.L1: l1_headers.analyze_async,
+    DetectionLayer.L2: unimplemented_layer(DetectionLayer.L2, "URL & redirect chain"),
+    DetectionLayer.L3: unimplemented_layer(DetectionLayer.L3, "NLP & obfuscation"),
+    DetectionLayer.L4: unimplemented_layer(DetectionLayer.L4, "threat intelligence"),
 }

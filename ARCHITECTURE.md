@@ -364,7 +364,80 @@ prepended forged header claiming a pass), the most severe wins, so a forged
 pass cannot mask a real failure.
 
 WHOIS is rate-limited and flaky. Mandatory SQLite cache with 7-day TTL,
-keyed on registrable domain. Cache negative lookups too.
+keyed on registrable domain. Cache negative lookups too — for 6 hours, not 7
+days: a registry that starts publishing a creation date should be believed the
+same day.
+
+**A lookup that did not complete is not a negative lookup.** Three states, not
+two, because conflating the last two is a real defect we shipped and caught in
+validation:
+
+| outcome | meaning | cached as | TTL |
+|---|---|---|---|
+| creation date returned | an answer | `{"found": true, …}` | 7 days |
+| registry reached, no date recorded | an answer | `{"found": false, …}` | 6 hours |
+| timeout / refused socket / quota / unparseable | **no answer** | `{"status": "unavailable", …}` | 5 minutes |
+
+The third row is a cooldown, not a result. It stops a broken registry being
+re-dialled once per message without ever claiming anything about the domain.
+A registry that answers correctly in ~10s against the 5s budget would
+otherwise have its timeout stored as a negative result for six hours — and
+because the retry timed out too, that domain's age became permanently
+unknowable. Only the first two rows are answers; the signal abstains on both
+of the latter, and `metadata["authoritative"]` says which kind of abstention
+it is.
+
+**Interfaces.** `analyze(source, *, whois_lookup=None, cache=None, now=None)`
+is the synchronous entry point and runs all six signals. `analyze_async` is
+the async adapter the orchestrator calls — `DEFAULT_LAYERS[DetectionLayer.L1]`
+points at it — and differs only in running the WHOIS lookup on a worker
+thread. Each signal is also a public function of its own. `source` may be a `ParsedEmail` or an
+`IngestedMessage` — the latter is read through `auth_headers()`, ingestion's
+own accessor for the authentication headers.
+
+- `WhoisLookup` is a `Protocol` with a single `creation_date(domain) ->
+  DomainAge`, and is the layer's only network-touching seam. `PythonWhoisLookup`
+  implements it over `python-whois`, imported lazily so the unit suite never
+  needs the client installed. A lookup that raises becomes an abstention, never
+  a clean result; `whois_lookup=None` abstains for the same reason.
+- `registrable_domain()` wraps `tldextract`, configured with the bundled suffix
+  list (`suffix_list_urls=()`) so the layer never fetches, and with the PSL's
+  private section included so `attacker.github.io` and `victim.github.io` are
+  different domains.
+- `BRAND_DOMAINS` maps each known brand to the registrable domains it
+  legitimately sends from. Impersonation requires both a brand token in the
+  display name *and* that the name presents itself as the brand — either it is
+  exactly the brand, or it carries transactional service vocabulary. "Apple
+  Valley Dental" mentions a brand; it does not claim to be one. No edit
+  distance, no model, no fuzzy threshold.
+- Every signal records `metadata["fired"]`. `DetectionSignal` has no such
+  field — a finding is a non-zero score and an abstention is an `error` — but
+  stating it keeps "did this fire" answerable without re-deriving it.
+
+Graceful degradation is **per signal, not per layer**: an unavailable WHOIS
+lookup abstains on `l1.domain_age_lt_7d` alone and the other five still
+report.
+
+**Orchestration.** The signals stay synchronous — they are string and date
+work, and the unit suite calls them without an event loop. `analyze_async` is
+the layer's adapter onto the orchestrator's `LayerCallable`, and it is what
+`DEFAULT_LAYERS[L1]` points at. It runs the five offline signals inline and
+hands only the WHOIS one to `asyncio.to_thread`, because that is the only call
+that blocks; moving the whole layer to a thread would offload five signals that
+are cheaper to run than to transfer.
+
+- `TimeLimitedWhoisLookup` wraps any `WhoisLookup` and abandons it after
+  `DEFAULT_WHOIS_TIMEOUT` (5s, chosen under L1's 8s layer timeout so the
+  registry cannot spend the layer's whole budget). It raises `WhoisTimeout`,
+  which `analyze_domain_age` already turns into an abstention with `error`
+  set — never into a 0.0 that would read as "checked, and the domain is
+  established" — and negatively caches for six hours, so a slow registry is
+  asked once rather than once per message.
+- `default_cache()` opens the `storage.cache.Cache` at `CACHE_DB_PATH` once per
+  process and hands it to `analyze_domain_age`. It is the cache the 7-day and
+  6-hour TTLs were always written against, not a second one. It is opened
+  lazily and only when there is a registrable domain to look up, and an
+  unopenable cache degrades to no caching rather than failing the layer.
 
 ### Layer 2 — URL & redirect chain
 `layers/l2_urls.py`

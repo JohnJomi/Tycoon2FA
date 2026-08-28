@@ -60,14 +60,18 @@ Do not proceed until this works.
 Offline-first layers. Layer 3 is the project centerpiece — budget two days.
 
 ### Layer 1 (half a day)
-- [ ] Parse `Authentication-Results` for spf/dkim/dmarc verdicts
+- [x] Parse `Authentication-Results` for spf/dkim/dmarc verdicts
   - *Accept:* correctly reports pass/fail on 5 real messages. Do **not**
     re-verify cryptographically.
-- [ ] Reply-To vs From registrable-domain comparison (`tldextract`)
-- [ ] WHOIS domain age, cached, 7-day TTL, negative caching
+- [x] Reply-To vs From registrable-domain comparison (`tldextract`)
+- [x] WHOIS domain age, cached, 7-day TTL, negative caching
   - *Accept:* handles WHOIS failure by abstaining with `error` set, never by
     returning `fired=False` silently.
-- [ ] Display-name brand impersonation check
+  - Three cache states, not two: a creation date is cached 7 days; a registry
+    that records no creation date is cached 6 hours; a timeout or unreachable
+    registry is **not** a negative result and gets a 5-minute cooldown, so a
+    slow-but-healthy registry cannot black a domain out for six hours.
+- [x] Display-name brand impersonation check
 
 ### Layer 3 (two days) ★
 - [ ] Zero-width scan — `[\u200b\u200c\u200d\u2060\ufeff]`

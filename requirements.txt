@@ -22,11 +22,14 @@ google-api-python-client>=2.100
 google-auth-httplib2>=0.2
 google-auth-oauthlib>=1.2
 
+# Layer 1 header & domain intelligence (ARCHITECTURE.md section 4)
+tldextract>=5.1
+python-whois>=0.9
+
 # Tests
 pytest>=8.2
 pytest-asyncio>=0.23
 
 # Deliberately deferred until the phase that needs them:
-#   Phase 2  tldextract, python-whois                        (Layer 1)
 #   Phase 2  scikit-learn, joblib, torch, transformers       (Layer 3)
 #   Phase 3  playwright, pyzbar, Pillow                      (Layer 2)
