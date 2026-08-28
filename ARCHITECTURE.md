@@ -388,8 +388,10 @@ of the latter, and `metadata["authoritative"]` says which kind of abstention
 it is.
 
 **Interfaces.** `analyze(source, *, whois_lookup=None, cache=None, now=None)`
-runs all six signals and is what the orchestrator calls; each signal is also a
-public function of its own. `source` may be a `ParsedEmail` or an
+is the synchronous entry point and runs all six signals. `analyze_async` is
+the async adapter the orchestrator calls — `DEFAULT_LAYERS[DetectionLayer.L1]`
+points at it — and differs only in running the WHOIS lookup on a worker
+thread. Each signal is also a public function of its own. `source` may be a `ParsedEmail` or an
 `IngestedMessage` — the latter is read through `auth_headers()`, ingestion's
 own accessor for the authentication headers.
 

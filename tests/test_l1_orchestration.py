@@ -22,7 +22,7 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from core.models import DetectionLayer, ParsedEmail
+from core.models import DetectionLayer, ParsedEmail, RiskLevel
 from core.orchestrator import DEFAULT_LAYERS, run_layers
 from layers import l1_headers
 from layers.l1_headers import (
@@ -274,14 +274,15 @@ async def test_layer_one_still_completes_while_other_layers_run(email, monkeypat
 
     results = await run_layers(email)
 
-    assert all(r.completed for r in results)
+    assert results[0].completed is True
     assert [r.layer for r in results] == [
         DetectionLayer.L1,
         DetectionLayer.L2,
         DetectionLayer.L3,
         DetectionLayer.L4,
     ]
-    # The three stub layers did not spend the WHOIS delay waiting their turn.
+    # The other three are unwritten, so they report incomplete - but they do it
+    # immediately rather than spending the WHOIS delay waiting their turn.
     for result in results[1:]:
         assert result.duration_ms < 100
 
@@ -700,7 +701,7 @@ def test_the_layer_one_budget_is_unchanged():
 
 
 @pytest.mark.asyncio
-async def test_l2_l4_still_complete_while_a_whois_lookup_times_out(email, monkeypatch):
+async def test_l2_l4_are_not_delayed_by_a_whois_timeout(email, monkeypatch):
     monkeypatch.setattr(
         l1_headers,
         "default_whois_lookup",
@@ -712,7 +713,7 @@ async def test_l2_l4_still_complete_while_a_whois_lookup_times_out(email, monkey
     elapsed = time.perf_counter() - started
 
     assert elapsed < 2.0
-    assert all(r.completed for r in results)
+    assert results[0].completed is True
     for result in results[1:]:
         assert result.duration_ms < 100
     assert _named(results[0].signals, "domain_age_lt_7d").metadata["authoritative"] is False
@@ -826,3 +827,167 @@ def test_a_client_failure_reaching_analyze_becomes_a_cooldown_not_a_negative(
     assert signal.metadata["authoritative"] is False
     assert cache.sets[0][1]["status"] == "unavailable"
     assert cache.sets[0][2] == WHOIS_UNAVAILABLE_TTL_SECONDS
+
+
+# --------------------------------------------------------------------------
+# 9. An unwritten layer must not dilute Layer 1
+#
+# `completed=True` with no signals is a claim - "I ran, and found nothing" -
+# and scoring counts it as a genuine 0.0 at the layer's full configured
+# weight. With L2-L4 unwritten and carrying 0.70 between them, that turned a
+# Layer 1 DMARC failure of 0.85 into a 0.255 composite: LOW, for a message
+# whose authentication genuinely failed.
+# --------------------------------------------------------------------------
+
+
+def _dmarc_failing_email() -> ParsedEmail:
+    return ParsedEmail(
+        message_id="<dmarc-fail@example.com>",
+        from_addr="billing@corp-invoices.com",
+        headers={"authentication-results": ["mx.google.com; dmarc=fail"]},
+    )
+
+
+@pytest.mark.asyncio
+async def test_unwritten_layers_report_incomplete_rather_than_clean():
+    from core.orchestrator import unimplemented_layer
+
+    run = unimplemented_layer(DetectionLayer.L2, "URL & redirect chain")
+
+    with pytest.raises(NotImplementedError) as caught:
+        await run(_dmarc_failing_email())
+
+    assert "L2" in str(caught.value)
+    assert "not implemented" in str(caught.value)
+
+
+@pytest.mark.asyncio
+async def test_a_layer_one_finding_is_not_diluted_by_the_unwritten_layers():
+    """The regression: this composite was 0.255/LOW when L2-L4 claimed to complete."""
+    from scoring.composite import score
+
+    results = await run_layers(_dmarc_failing_email())
+    assessment = score("<dmarc-fail@example.com>", results)
+
+    assert [r.completed for r in results] == [True, False, False, False]
+    assert assessment.layers_completed == [DetectionLayer.L1]
+    # L1's weight renormalizes to 1.0, so the layer score reaches the composite.
+    assert assessment.score == pytest.approx(0.85)
+    assert assessment.level is RiskLevel.HIGH
+
+
+@pytest.mark.asyncio
+async def test_the_unwritten_layers_carry_no_scoring_weight():
+    from scoring.composite import layer_contributions
+
+    results = await run_layers(_dmarc_failing_email())
+    contributions = layer_contributions(results)
+
+    assert set(contributions) == {DetectionLayer.L1}
+    assert DetectionLayer.L2 not in contributions
+
+
+@pytest.mark.asyncio
+async def test_an_unwritten_layer_is_never_reported_as_a_clean_result():
+    results = await run_layers(_dmarc_failing_email())
+
+    for result in results[1:]:
+        assert result.completed is False
+        assert result.signals == []      # no fake signals were invented
+        assert result.error is not None  # and the reason is stated
+
+
+# --------------------------------------------------------------------------
+# 10. A caller-supplied naive `now`
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_a_naive_now_does_not_raise_and_matches_the_aware_result(email):
+    """WHOIS dates are UTC-aware; a naive `now` used to reach the subtraction."""
+    naive = datetime(2026, 8, 28, 12, 0)
+    aware = datetime(2026, 8, 28, 12, 0, tzinfo=timezone.utc)
+    created = aware - timedelta(days=2)
+
+    from_naive = await analyze_async(
+        email, whois_lookup=FakeWhois(created), cache=None, now=naive
+    )
+    from_aware = await analyze_async(
+        email, whois_lookup=FakeWhois(created), cache=None, now=aware
+    )
+
+    a = _named(from_naive, "domain_age_lt_7d")
+    b = _named(from_aware, "domain_age_lt_7d")
+    assert a.score == b.score > 0
+    assert a.metadata["age_days"] == b.metadata["age_days"] == pytest.approx(2.0)
+
+
+def test_an_aware_now_in_another_timezone_is_converted_not_replaced():
+    from datetime import timezone as tz
+
+    plus_five = tz(timedelta(hours=5, minutes=30))
+    same_instant = datetime(2026, 8, 28, 17, 30, tzinfo=plus_five)  # == 12:00Z
+
+    signal = l1_headers.analyze_domain_age(
+        _dmarc_failing_email(),
+        lookup=FakeWhois(datetime(2026, 8, 26, 12, 0, tzinfo=timezone.utc)),
+        cache=None,
+        now=same_instant,
+    )
+
+    assert signal.metadata["age_days"] == pytest.approx(2.0)
+
+
+def test_a_naive_now_never_raises_through_the_synchronous_entry_point():
+    signals = l1_headers.analyze(
+        _dmarc_failing_email(),
+        whois_lookup=FakeWhois(datetime(2026, 8, 26, 12, 0, tzinfo=timezone.utc)),
+        now=datetime(2026, 8, 28, 12, 0),
+    )
+
+    assert _named(signals, "domain_age_lt_7d").metadata["age_days"] == pytest.approx(2.0)
+
+
+# --------------------------------------------------------------------------
+# 11. What a timed-out WHOIS thread leaves behind
+#
+# The abandoned lookup thread is real, and bounded: it is a daemon, so it
+# never holds up interpreter exit, and it ends on its own when the underlying
+# call returns. See the module docstring on TimeLimitedWhoisLookup.
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_an_abandoned_lookup_thread_is_a_daemon_and_is_reclaimed():
+    class Hanging:
+        def creation_date(self, domain: str) -> DomainAge:
+            time.sleep(0.4)
+            return DomainAge(domain=domain, created_at=NOW)
+
+    bounded = TimeLimitedWhoisLookup(Hanging(), timeout=0.02)
+
+    # Domains unique to this test: other tests in this module deliberately
+    # abandon their own lookup threads, and those must not be counted here.
+    def mine() -> list[threading.Thread]:
+        return [t for t in threading.enumerate() if t.name.startswith("whois-abandoned-")]
+
+    for i in range(5):
+        message = ParsedEmail(
+            message_id=f"<t{i}@x.y>", from_addr=f"a@abandoned-{i}.com"
+        )
+        signal = await asyncio.to_thread(
+            l1_headers.analyze_domain_age, message, lookup=bounded, cache=None, now=NOW
+        )
+        assert signal.error is not None
+
+    abandoned = mine()
+    assert abandoned, "expected the timed-out lookups to still be running"
+    assert all(t.daemon for t in abandoned), "a non-daemon thread would block exit"
+
+    # They end by themselves once the underlying call returns - nothing leaks,
+    # so no thread-management machinery is needed to reclaim them.
+    deadline = time.perf_counter() + 5.0
+    while mine() and time.perf_counter() < deadline:
+        await asyncio.sleep(0.05)
+
+    assert mine() == []

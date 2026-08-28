@@ -477,7 +477,7 @@ def test_ordinary_display_names_do_not_fire(from_header):
 
 @pytest.mark.parametrize(
     "display",
-    ["Micros0ft Security", "PayPa1 Service", "Amaz0n Billing", "M​icrosoft Team",
+    ["Micros0ft Security", "PayPa1 Service", "Amaz0n Billing", "M\u200bicrosoft Team",
      "MICROSOFT ACCOUNT", "micro-soft support", "Micro Soft Team"],
 )
 def test_confusable_and_split_spellings_still_match(display):

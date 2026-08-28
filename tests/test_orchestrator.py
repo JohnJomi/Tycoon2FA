@@ -212,13 +212,19 @@ async def test_default_l1_emits_no_stub_signal(email):
 
 
 @pytest.mark.asyncio
-async def test_default_l2_l3_l4_stubs_complete_with_no_signals(email):
+async def test_default_l2_l3_l4_report_themselves_as_unimplemented(email):
+    """An unwritten layer must not look like a layer that ran and found nothing.
+
+    `completed=True` with no signals is a claim of innocence that scoring counts
+    at the layer's full weight; `completed=False` means "no information" and
+    gets its weight redistributed onto the layers that did run.
+    """
     results = _by_layer(await run_layers(email))
 
     for layer in (DetectionLayer.L2, DetectionLayer.L3, DetectionLayer.L4):
-        assert results[layer].completed is True
+        assert results[layer].completed is False
         assert results[layer].signals == []
-        assert results[layer].error is None
+        assert "not implemented" in results[layer].error
 
 
 @pytest.mark.asyncio
@@ -461,8 +467,11 @@ async def test_a_none_returning_layer_does_not_stop_the_others(email):
     results = _by_layer(await run_layers(email, layers={DetectionLayer.L2: returns_none}))
 
     assert results[DetectionLayer.L2].completed is False
-    for layer in (DetectionLayer.L1, DetectionLayer.L3, DetectionLayer.L4):
-        assert results[layer].completed is True
+    # L1 is real and still ran. L3/L4 are unwritten and report that - a
+    # different reason from L2's, but neither stopped the others.
+    assert results[DetectionLayer.L1].completed is True
+    for layer in (DetectionLayer.L3, DetectionLayer.L4):
+        assert "not implemented" in results[layer].error
 
 
 @pytest.mark.asyncio
@@ -474,10 +483,11 @@ async def test_partial_custom_layer_mapping_still_runs_all_four_layers(email):
 
     assert [r.layer for r in results] == ALL_LAYERS
     assert results[1].signals[0].name == "custom"
-    # The untouched defaults still ran.
+    # The untouched defaults still ran: L1 produced its signals, and the
+    # unwritten layers reported themselves rather than being skipped.
     assert [s.name for s in results[0].signals] == L1_SIGNAL_NAMES
-    assert results[2].completed is True and results[2].signals == []
-    assert results[3].completed is True and results[3].signals == []
+    assert results[2].completed is False and "not implemented" in results[2].error
+    assert results[3].completed is False and "not implemented" in results[3].error
 
 
 # --------------------------------------------------------------------------

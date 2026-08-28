@@ -67,6 +67,10 @@ Offline-first layers. Layer 3 is the project centerpiece — budget two days.
 - [x] WHOIS domain age, cached, 7-day TTL, negative caching
   - *Accept:* handles WHOIS failure by abstaining with `error` set, never by
     returning `fired=False` silently.
+  - Three cache states, not two: a creation date is cached 7 days; a registry
+    that records no creation date is cached 6 hours; a timeout or unreachable
+    registry is **not** a negative result and gets a 5-minute cooldown, so a
+    slow-but-healthy registry cannot black a domain out for six hours.
 - [x] Display-name brand impersonation check
 
 ### Layer 3 (two days) ★

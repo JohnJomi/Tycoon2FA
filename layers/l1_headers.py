@@ -6,9 +6,11 @@ Signals specified in ARCHITECTURE.md section 4:
   l1.domain_age_lt_7d            WHOIS creation date (cached, 7-day TTL)
   l1.display_name_impersonation  brand token in display name, not in domain
 
-All four are implemented. `analyze` runs the whole layer and is what the
-orchestrator calls; the per-signal entry points stay public because each is
-independently meaningful and independently testable.
+All four are implemented. `analyze` is the synchronous entry point and runs
+the whole layer; `analyze_async` is the async adapter the orchestrator calls
+(`DEFAULT_LAYERS[DetectionLayer.L1]`), and differs only in running the WHOIS
+lookup on a worker thread. The per-signal entry points stay public because
+each is independently meaningful and independently testable.
 
 Every signal accepts either a `ParsedEmail` or an `IngestedMessage`. The
 latter is the ingestion boundary's own type and is preferred - it carries
@@ -745,14 +747,27 @@ def analyze_domain_age(
     protect. `lookup=None` abstains for the same reason: no lookup was
     configured, so nothing was checked.
 
-    `cache` is a `storage.cache.Cache` (or anything with its `get`/`set`).
-    Successes are cached for 7 days and failures for 6 hours, both keyed on the
-    registrable domain, so a rate-limited registry is asked once rather than
-    once per message. Never raises.
+    `cache` is a `storage.cache.Cache` (or anything with its `get`/`set`), keyed
+    on the registrable domain, with three states rather than two:
+
+    - a creation date is an answer, cached 7 days (`WHOIS_TTL_SECONDS`);
+    - a registry reached that records no creation date is also an answer,
+      cached 6 hours (`WHOIS_NEGATIVE_TTL_SECONDS`);
+    - a timeout, refused socket, quota rejection or unparseable response is
+      **not** an answer, and gets a 5-minute cooldown
+      (`WHOIS_UNAVAILABLE_TTL_SECONDS`) so the registry is not re-dialled once
+      per message while the domain stays due for another attempt.
+
+    Never raises.
     """
     email = _parsed_email(source)
     domain = registrable_domain(email.from_addr)
-    now = now or datetime.now(timezone.utc)
+    # WHOIS creation dates are normalized to UTC, so `now` must be too. A naive
+    # `now` from a caller would otherwise reach the subtraction in
+    # `_domain_age_signal` and raise TypeError, breaking the never-raises
+    # contract for a signal whose whole job is to degrade quietly. An aware
+    # datetime is converted, not replaced.
+    now = _as_utc(now) if now is not None else datetime.now(timezone.utc)
 
     if domain is None:
         return _domain_signal(
@@ -1262,11 +1277,30 @@ class TimeLimitedWhoisLookup:
     overruns - a blocking socket read cannot be cancelled from outside, and a
     non-daemon thread would keep the interpreter alive at exit.
 
+    **On the abandoned thread.** It is real, and it is bounded. It is a daemon,
+    so it never delays interpreter exit; it ends by itself when the underlying
+    call returns, so nothing accumulates without limit; and it holds a socket
+    and a stack frame, not a pooled worker - `asyncio.to_thread`'s executor
+    thread is released the moment this method raises. Concurrent abandoned
+    threads are capped by how many *distinct* domains time out inside one
+    client-socket lifetime, and the 5-minute unavailable cooldown means one
+    domain contributes at most one attempt per five minutes. Measured: 20
+    consecutive timeouts peak at 20 daemon threads and return to zero once the
+    underlying calls finish.
+
+    Bounding it harder would mean either a fixed-size executor - which turns a
+    slow registry into a queue that *does* eat the 8s layer budget - or
+    reaching into the client's socket, which is more machinery than a
+    self-clearing daemon thread warrants at this phase. Revisit if ingestion
+    ever fans out across messages concurrently, which would raise the ceiling
+    from one in flight to one per concurrent message.
+
     Raising is the point. `analyze_domain_age` turns any exception from
-    `creation_date` into an abstention carrying `error`, and caches it
-    negatively for six hours, so a timeout reaches the caller as "not checked"
-    rather than as "checked, and the domain is established" - and one slow
-    registry is asked once, not once per message.
+    `creation_date` into an abstention carrying `error`, cached as a 5-minute
+    *unavailable* cooldown rather than as a negative result, so a timeout
+    reaches the caller as "not checked" rather than as "checked, and the domain
+    is established" - and one slow registry is asked once every few minutes,
+    not once per message.
     """
 
     def __init__(
@@ -1332,9 +1366,10 @@ def default_cache() -> object | None:
     never creates a database, and so the unit suite - which passes its own
     cache or none - never touches the file.
 
-    The TTLs stay where they were decided: `analyze_domain_age` writes
-    successes with `WHOIS_TTL_SECONDS` and failures with
-    `WHOIS_NEGATIVE_TTL_SECONDS`. This function only supplies the store.
+    The TTLs stay where they were decided: `analyze_domain_age` writes answers
+    with `WHOIS_TTL_SECONDS` or `WHOIS_NEGATIVE_TTL_SECONDS` and incomplete
+    lookups with `WHOIS_UNAVAILABLE_TTL_SECONDS`. This function only supplies
+    the store.
 
     Returns None if the cache cannot be opened. An unwritable cache directory
     is a reason to look domains up every time, not a reason to fail the layer.
