@@ -16,12 +16,10 @@ way to scoring, because collapsing them turns an outage into an all-clear.
 Scope: this module runs layers and reports what happened. It does not score,
 does not decide a verdict, and does not know what any layer looks for.
 
-TEMPORARY SCAFFOLD
-------------------
-The real detection layers do not exist yet. The stubs at the bottom of this
-module stand in for them so the orchestration path can be exercised end to
-end. They perform **no detection whatsoever** and are replaced by the real
-`layers/` implementations in Phase 2.
+Layer 1 is real: `DEFAULT_LAYERS` points at `layers.l1_headers.analyze_async`,
+which is the layer's own async adapter. Layers 2-4 are still the `stub_empty`
+scaffold below - they complete with no signals - and are replaced as each
+layer lands.
 """
 
 from __future__ import annotations
@@ -30,12 +28,13 @@ import asyncio
 import time
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 
-from core.models import DetectionLayer, DetectionSignal, LayerResult, ParsedEmail, RiskLevel
+from core.models import DetectionLayer, DetectionSignal, LayerResult, ParsedEmail
+from layers import l1_headers
 
 __all__ = [
+    "DEFAULT_LAYERS",
     "DEFAULT_LAYER_TIMEOUTS",
     "DEFAULT_TOTAL_TIMEOUT",
-    "STUB_L1_SIGNAL_NAME",
     "LayerCallable",
     "run_layers",
 ]
@@ -57,9 +56,6 @@ DEFAULT_LAYER_TIMEOUTS: Mapping[DetectionLayer, float] = {
 # Wall-clock cap on the whole gather. A backstop only: every per-layer timeout
 # is strictly below it, so it fires only if a layer refuses to be cancelled.
 DEFAULT_TOTAL_TIMEOUT = 20.0
-
-STUB_L1_SIGNAL_NAME = "orchestrator_stub"
-
 
 def _elapsed_ms(started: float) -> int:
     """Milliseconds since a perf_counter start, never negative."""
@@ -188,30 +184,11 @@ async def run_layers(
 
 
 # --------------------------------------------------------------------------
-# TEMPORARY LAYER STUBS - scaffolding for Phase 1 only
+# The layer mapping
 #
-# These are not detectors. They exist so the orchestration path can be tested
-# before layers/ is implemented, and they are deleted once the real layers
-# land in Phase 2. None of them looks at the email at all.
+# L1 is the real implementation. L2-L4 are still scaffolding: `stub_empty`
+# performs no detection and is replaced as each layer lands.
 # --------------------------------------------------------------------------
-
-
-async def stub_l1(email: ParsedEmail) -> list[DetectionSignal]:
-    """Return one hardcoded placeholder signal. Performs no detection."""
-    return [
-        DetectionSignal(
-            layer=DetectionLayer.L1,
-            name=STUB_L1_SIGNAL_NAME,
-            score=0.5,
-            severity=RiskLevel.MEDIUM,
-            evidence=(
-                "TEMPORARY STUB: hardcoded placeholder emitted by "
-                "core/orchestrator.py. No header, domain or authentication "
-                "check has been performed."
-            ),
-            metadata={"stub": True},
-        )
-    ]
 
 
 async def stub_empty(email: ParsedEmail) -> list[DetectionSignal]:
@@ -219,8 +196,12 @@ async def stub_empty(email: ParsedEmail) -> list[DetectionSignal]:
     return []
 
 
+# `analyze_async` is Layer 1's own adapter onto LayerCallable, and every
+# argument beyond the email defaults: the WHOIS client, its timeout and the
+# shared cache are the layer's decisions, not the orchestrator's. This module
+# still knows nothing about what any layer looks for.
 DEFAULT_LAYERS: Mapping[DetectionLayer, LayerCallable] = {
-    DetectionLayer.L1: stub_l1,
+    DetectionLayer.L1: l1_headers.analyze_async,
     DetectionLayer.L2: stub_empty,
     DetectionLayer.L3: stub_empty,
     DetectionLayer.L4: stub_empty,

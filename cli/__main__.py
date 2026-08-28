@@ -7,9 +7,9 @@ signal table plus the composite verdict:
 
     parse_email -> run_layers -> score -> printed report
 
-The layers behind `run_layers` are still the Phase 1 stubs, so the scores
-below are placeholders and the report says so. Replacing the stubs in Phase 2
-requires no change here.
+Layer 1 behind `run_layers` is real; Layers 2-4 are still stubs, so the
+composite score is partial and the report says so. Replacing the remaining
+stubs requires no change here.
 
 Exit status: 0 on a completed analysis, 1 on unreadable input or a pipeline
 failure, 2 on a usage error (argparse's own convention).
@@ -118,8 +118,8 @@ def _format_report(
     lines.append(f"  scored over: {completed}")
 
     lines.append(
-        "\nNOTE: Phase 1 - the detection layers are stubs. These scores are "
-        "placeholders, not findings."
+        "\nNOTE: Layer 1 is implemented; Layers 2-4 are still stubs, so this "
+        "score reflects header and domain signals only."
     )
     return "\n".join(lines)
 

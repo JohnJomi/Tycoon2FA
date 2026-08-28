@@ -47,7 +47,10 @@ be completed, so there is no verdict to report either way.
 
 from __future__ import annotations
 
+import asyncio
+import os
 import re
+import threading
 import unicodedata
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -60,17 +63,26 @@ from core.models import DetectionLayer, DetectionSignal, ParsedEmail, RiskLevel
 __all__ = [
     "AUTH_METHODS",
     "BRAND_DOMAINS",
+    "DEFAULT_WHOIS_TIMEOUT",
+    "WHOIS_UNAVAILABLE_TTL_SECONDS",
     "AuthVerdict",
     "DomainAge",
     "WhoisLookup",
+    "WhoisTimeout",
+    "WhoisUnavailable",
     "PythonWhoisLookup",
+    "TimeLimitedWhoisLookup",
     "analyze",
+    "analyze_async",
     "analyze_authentication_results",
     "analyze_display_name_impersonation",
     "analyze_domain_age",
     "analyze_reply_to_mismatch",
+    "default_cache",
+    "default_whois_lookup",
     "parse_authentication_results",
     "registrable_domain",
+    "reset_default_cache",
 ]
 
 # The methods reported on, in the order their signals are emitted.
@@ -570,12 +582,22 @@ def analyze_reply_to_mismatch(source: ParsedEmail | object) -> DetectionSignal:
 # successful lookup is cached for 7 days, keyed on registrable domain.
 WHOIS_TTL_SECONDS = 7 * 24 * 3600
 
-# Failures are cached too, and for much less time. Not caching them turns one
-# rate-limited registry into a retry storm on every message from that domain;
-# caching them for a week would blind the layer to a domain whose WHOIS was
-# merely briefly unavailable. Six hours matches the intel-feed TTL in
-# `storage.cache`.
+# A *genuine negative* - the registry answered, and recorded no creation date
+# for the domain - is cached for six hours, matching the intel-feed TTL in
+# `storage.cache`. It is a real answer, so it is worth keeping; it is not worth
+# keeping for a week, because a registry that starts publishing the date should
+# be believed the same day.
 WHOIS_NEGATIVE_TTL_SECONDS = 6 * 3600
+
+# A lookup that could not be completed at all - a timeout, a refused socket, a
+# quota rejection - is **not** an answer about the domain, and must never be
+# stored as one. It gets a short cooldown instead: long enough that a broken
+# registry is not re-dialled once per message, short enough that a domain is
+# not blacked out over it. Real validation is what set this: a registry that
+# answers correctly in ~10s exceeds the 5s budget, and under a six-hour
+# negative entry that domain's age became permanently unknowable - the timeout
+# recurring before the entry ever expired.
+WHOIS_UNAVAILABLE_TTL_SECONDS = 5 * 60
 
 # A domain registered within this window is the signal's subject. Named for the
 # signal in the architecture table, `l1.domain_age_lt_7d`.
@@ -584,6 +606,37 @@ YOUNG_DOMAIN_DAYS = 7
 _DOMAIN_AGE_SCORE = 0.65
 
 _CACHE_KEY_PREFIX = "l1:whois:created"
+
+# Marks a cache entry as a cooldown rather than an answer. A stored entry
+# without it is a real WHOIS result: `found` true with a date, or false for a
+# registry that recorded none.
+_UNAVAILABLE = "unavailable"
+
+
+class WhoisUnavailable(RuntimeError):
+    """The lookup could not be completed, so nothing was learned.
+
+    Raised for every condition that is *not* an answer about the domain: a
+    timeout, a refused or reset socket, a quota rejection, an unparseable
+    response. The distinction from a genuine negative is the one this class
+    exists to keep: "the registry says there is no such domain" is a fact worth
+    caching, while "the registry did not answer" is the absence of a fact and
+    must never be stored as one.
+    """
+
+
+class WhoisTimeout(WhoisUnavailable, TimeoutError):
+    """A WHOIS lookup exceeded its own budget.
+
+    A slow registry is not a registry that said no. Real validation found one
+    that answers correctly in ~10s against a 5s budget: treating that as a
+    negative result cached the *absence* of an answer for six hours, and since
+    the next attempt timed out too, the domain's age was never learned.
+
+    So this is a `WhoisUnavailable`, and the caller abstains and schedules a
+    retry rather than recording anything about the domain. `TimeoutError` stays
+    in the bases so ordinary `except TimeoutError` handling still catches it.
+    """
 
 
 @dataclass(frozen=True)
@@ -603,9 +656,19 @@ class WhoisLookup(Protocol):
     """The one network-touching seam in Layer 1.
 
     A protocol so the signal can be exercised without WHOIS: the unit suite
-    injects a fake and never opens a socket. An implementation returns a
-    `DomainAge` or raises; raising is how "the lookup failed" is expressed,
-    and the caller turns that into an abstention rather than a clean result.
+    injects a fake and never opens a socket.
+
+    The contract is two-way, and the distinction is the whole point:
+
+    - **Returning** a `DomainAge` is an *answer about the domain*. A
+      `created_at` of None is a genuine negative - the registry was reached and
+      recorded no creation date - and is cached as such.
+    - **Raising** means the lookup could not be completed, so nothing was
+      learned about the domain. The caller abstains and does not store it as an
+      answer. Implementations should raise `WhoisUnavailable` (or
+      `WhoisTimeout`), but *any* exception is treated as non-authoritative: an
+      unrecognized failure is precisely the case where claiming to know
+      something would be wrong.
     """
 
     def creation_date(self, domain: str) -> DomainAge: ...
@@ -617,12 +680,34 @@ class PythonWhoisLookup:
     Imported lazily, inside the call, so importing this module never pulls in
     the WHOIS client - the unit suite injects a fake and must not depend on it
     being installed or on any of its import-time behaviour.
+
+    Its job beyond fetching is to sort the client's exceptions into the two
+    halves of the protocol. `python-whois` distinguishes them itself:
+    `WhoisDomainNotFoundError` means the registry replied "no match", which is
+    an answer, while a quota rejection, a failed command or an unparseable
+    response means the question never got answered. Only the first becomes a
+    `DomainAge`; everything else is re-raised as `WhoisUnavailable` so no
+    caller can mistake a transport failure for a fact about the domain.
     """
 
     def creation_date(self, domain: str) -> DomainAge:
         import whois  # noqa: PLC0415 - deliberately lazy, see docstring
 
-        record = whois.whois(domain)
+        not_found = getattr(
+            getattr(whois, "exceptions", None), "WhoisDomainNotFoundError", ()
+        )
+        try:
+            record = whois.whois(domain)
+        except not_found:
+            # Authoritative: the registry was reached and has no such domain.
+            # There is no creation date because there is nothing registered.
+            return DomainAge(domain=domain, created_at=None)
+        except Exception as exc:  # noqa: BLE001 - re-raised, never swallowed
+            raise WhoisUnavailable(
+                f"WHOIS lookup for {domain} could not be completed "
+                f"({type(exc).__name__})"
+            ) from exc
+
         created = getattr(record, "creation_date", None)
         if isinstance(created, list):
             # Several registrars report a list. The earliest is the domain's
@@ -692,9 +777,12 @@ def analyze_domain_age(
 
     cached = _cache_get(cache, domain)
     if cached is not None:
-        if not cached.get("found", False):
+        if cached.get("status") == _UNAVAILABLE:
+            # A cooldown entry, not an answer. It suppresses re-dialling a
+            # registry that just failed; it does not claim anything.
             return _whois_unavailable(
-                domain, cached.get("reason") or "WHOIS lookup failed", cached=True
+                domain, cached.get("reason") or "WHOIS lookup could not be completed",
+                cached=True,
             )
         age = DomainAge(domain=domain, created_at=_from_iso(cached.get("created_at")))
         return _domain_age_signal(age, now, cached=True)
@@ -702,28 +790,39 @@ def analyze_domain_age(
     try:
         age = lookup.creation_date(domain)
     except Exception as exc:  # noqa: BLE001 - any WHOIS client failure
-        # The exception text can carry the registry's raw response, so only
-        # the exception's type is recorded or shown.
-        reason = f"WHOIS lookup failed ({type(exc).__name__})"
-        _cache_set(cache, domain, {"found": False, "reason": reason},
-                   WHOIS_NEGATIVE_TTL_SECONDS)
+        # Nothing was learned about the domain. Every exception lands here,
+        # not only `WhoisUnavailable`: an unrecognized failure is exactly the
+        # case where recording an answer would be wrong. The exception text can
+        # carry the registry's raw response, so only its type is shown.
+        reason = (
+            f"WHOIS lookup timed out ({type(exc).__name__})"
+            if isinstance(exc, TimeoutError)
+            else f"WHOIS lookup could not be completed ({type(exc).__name__})"
+        )
+        _cache_set(cache, domain, {"status": _UNAVAILABLE, "reason": reason},
+                   WHOIS_UNAVAILABLE_TTL_SECONDS)
         return _whois_unavailable(domain, reason, cached=False)
 
     if not isinstance(age, DomainAge):
+        # A lookup that does not honour the protocol has told us nothing
+        # either, so it is a cooldown rather than a negative result.
         reason = "WHOIS lookup returned an unusable result"
-        _cache_set(cache, domain, {"found": False, "reason": reason},
-                   WHOIS_NEGATIVE_TTL_SECONDS)
+        _cache_set(cache, domain, {"status": _UNAVAILABLE, "reason": reason},
+                   WHOIS_UNAVAILABLE_TTL_SECONDS)
         return _whois_unavailable(domain, reason, cached=False)
+
+    if age.created_at is None:
+        # A genuine negative: the registry was reached and recorded no creation
+        # date. That is an answer, and it is the one the six-hour negative TTL
+        # was written for.
+        _cache_set(cache, domain, {"found": False, "created_at": None},
+                   WHOIS_NEGATIVE_TTL_SECONDS)
+        return _domain_age_signal(age, now, cached=False)
 
     _cache_set(
         cache,
         domain,
-        {
-            "found": True,
-            "created_at": (
-                _as_utc(age.created_at).isoformat() if age.created_at else None
-            ),
-        },
+        {"found": True, "created_at": _as_utc(age.created_at).isoformat()},
         WHOIS_TTL_SECONDS,
     )
     return _domain_age_signal(age, now, cached=False)
@@ -741,7 +840,14 @@ def _domain_age_signal(age: DomainAge, now: datetime, *, cached: bool) -> Detect
             RiskLevel.LOW,
             f"WHOIS records no creation date for {age.domain}{source_note}, so "
             f"its age is unknown.",
-            metadata={"domain": age.domain, "cached": cached, "created_at": None},
+            metadata={
+                "domain": age.domain,
+                "cached": cached,
+                "created_at": None,
+                # The registry was reached: this abstention is a fact about the
+                # domain, unlike the one from a lookup that never completed.
+                "authoritative": True,
+            },
             error="WHOIS recorded no creation date",
         )
 
@@ -780,14 +886,20 @@ def _domain_age_signal(age: DomainAge, now: datetime, *, cached: bool) -> Detect
 
 
 def _whois_unavailable(domain: str, reason: str, *, cached: bool) -> DetectionSignal:
+    """Abstain because the lookup did not complete - never a result.
+
+    Distinct from the abstention for a registry that answered without a date:
+    that one is a fact about the domain, this one is the absence of one, and
+    only this one leaves the domain due for another attempt.
+    """
     return _domain_signal(
         "domain_age_lt_7d",
         0.0,
         RiskLevel.LOW,
         f"The age of {domain} could not be determined: {reason}"
-        f"{' (negative cache)' if cached else ''}. This signal abstains rather "
-        f"than reporting the domain as established.",
-        metadata={"domain": domain, "cached": cached},
+        f"{' (cached; the lookup will be retried once the cooldown expires)' if cached else ''}"
+        f". This signal abstains rather than reporting the domain as established.",
+        metadata={"domain": domain, "cached": cached, "authoritative": False},
         error=reason,
     )
 
@@ -1115,3 +1227,214 @@ def analyze(
     )
     signals.append(analyze_display_name_impersonation(source))
     return signals
+
+
+# --------------------------------------------------------------------------
+# Orchestration seam
+# --------------------------------------------------------------------------
+#
+# Everything above is synchronous and stays that way: the signals are string
+# and date work, they are directly callable, and the unit suite exercises them
+# without an event loop. The orchestrator, however, is async and expects a
+# `LayerCallable` - a coroutine function taking the email and returning
+# signals. `analyze_async` is that adapter, and it is deliberately thin.
+#
+# It exists for one reason beyond the await: `analyze` blocks on WHOIS, and
+# blocking the event loop would stall the three layers running beside this one.
+# Only the WHOIS signal is offloaded to a worker thread. The other five are
+# pure in-process parsing and are cheaper to run inline than to hand across a
+# thread boundary.
+
+
+# Well under `core.orchestrator.DEFAULT_LAYER_TIMEOUTS[L1]`, which is 8s. The
+# layer timeout is the orchestrator's backstop against a broken layer; it is
+# not a WHOIS budget. If the registry is the slow one, this fires first and the
+# other five signals still reach the caller.
+DEFAULT_WHOIS_TIMEOUT = 5.0
+
+
+class TimeLimitedWhoisLookup:
+    """A `WhoisLookup` that gives up on a slow one.
+
+    `python-whois` talks to a registry over a socket it does not let the caller
+    bound, and a hung registry would otherwise hold the whole Layer 1 budget.
+    The wrapped lookup runs on a daemon thread that is simply abandoned when it
+    overruns - a blocking socket read cannot be cancelled from outside, and a
+    non-daemon thread would keep the interpreter alive at exit.
+
+    Raising is the point. `analyze_domain_age` turns any exception from
+    `creation_date` into an abstention carrying `error`, and caches it
+    negatively for six hours, so a timeout reaches the caller as "not checked"
+    rather than as "checked, and the domain is established" - and one slow
+    registry is asked once, not once per message.
+    """
+
+    def __init__(
+        self,
+        inner: WhoisLookup | None = None,
+        timeout: float = DEFAULT_WHOIS_TIMEOUT,
+    ) -> None:
+        if timeout <= 0:
+            raise ValueError(f"timeout must be positive, got {timeout!r}")
+        self._inner = inner if inner is not None else PythonWhoisLookup()
+        self._timeout = float(timeout)
+
+    @property
+    def timeout(self) -> float:
+        return self._timeout
+
+    def creation_date(self, domain: str) -> DomainAge:
+        # A one-slot list rather than a Queue: the worker writes once and this
+        # thread reads only after join(), so there is nothing to synchronize.
+        outcome: list[tuple[bool, object]] = []
+
+        def _run() -> None:
+            try:
+                outcome.append((True, self._inner.creation_date(domain)))
+            except BaseException as exc:  # noqa: BLE001 - re-raised on the caller's thread
+                outcome.append((False, exc))
+
+        worker = threading.Thread(
+            target=_run, name=f"whois-{domain}", daemon=True
+        )
+        worker.start()
+        worker.join(self._timeout)
+
+        if not outcome:
+            raise WhoisTimeout(
+                f"WHOIS lookup for {domain} exceeded {self._timeout:g}s"
+            )
+
+        succeeded, value = outcome[0]
+        if succeeded:
+            return value  # type: ignore[return-value]
+        raise value  # type: ignore[misc]
+
+
+# `analyze_async`'s defaults are resolved per call rather than at import, so
+# this sentinel distinguishes "the caller said nothing" from an explicit
+# `cache=None` / `whois_lookup=None`, both of which are meaningful.
+_UNSET: object = object()
+
+_DEFAULT_CACHE_PATH = "storage/cache.db"
+
+_default_cache_lock = threading.Lock()
+_default_cache: object | None = None
+_default_cache_resolved = False
+
+
+def default_cache() -> object | None:
+    """The process-wide `storage.cache.Cache`, opened once and reused.
+
+    This is the cache the architecture already specifies for WHOIS - not a
+    second one. It is opened lazily, on first use, at `CACHE_DB_PATH` (the
+    variable `.env.example` already defines) so that importing this module
+    never creates a database, and so the unit suite - which passes its own
+    cache or none - never touches the file.
+
+    The TTLs stay where they were decided: `analyze_domain_age` writes
+    successes with `WHOIS_TTL_SECONDS` and failures with
+    `WHOIS_NEGATIVE_TTL_SECONDS`. This function only supplies the store.
+
+    Returns None if the cache cannot be opened. An unwritable cache directory
+    is a reason to look domains up every time, not a reason to fail the layer.
+    """
+    global _default_cache, _default_cache_resolved
+
+    with _default_cache_lock:
+        if not _default_cache_resolved:
+            _default_cache_resolved = True
+            try:
+                from storage.cache import Cache  # noqa: PLC0415 - lazy, see docstring
+
+                path = os.environ.get("CACHE_DB_PATH") or _DEFAULT_CACHE_PATH
+                _default_cache = Cache(path)
+            except Exception:  # noqa: BLE001 - a cache is an optimization, not a dependency
+                _default_cache = None
+        return _default_cache
+
+
+def reset_default_cache() -> None:
+    """Forget the memoized default cache. For tests that repoint CACHE_DB_PATH."""
+    global _default_cache, _default_cache_resolved
+
+    with _default_cache_lock:
+        cache = _default_cache
+        _default_cache = None
+        _default_cache_resolved = False
+
+    close = getattr(cache, "close", None)
+    if callable(close):
+        try:
+            close()
+        except Exception:  # noqa: BLE001 - closing a spent cache must not raise
+            pass
+
+
+def default_whois_lookup() -> WhoisLookup:
+    """The real WHOIS client, bounded by `DEFAULT_WHOIS_TIMEOUT`."""
+    return TimeLimitedWhoisLookup(PythonWhoisLookup(), DEFAULT_WHOIS_TIMEOUT)
+
+
+async def analyze_async(
+    source: ParsedEmail | object,
+    *,
+    whois_lookup: WhoisLookup | None | object = _UNSET,
+    cache: object | None = _UNSET,
+    now: datetime | None = None,
+) -> list[DetectionSignal]:
+    """`analyze` for an event loop. This is the orchestrator's `LayerCallable`.
+
+    Same six signals, same order, same contents - the only difference is where
+    the WHOIS call runs. The five offline signals are produced by `analyze`
+    itself (with its lookup disabled, so it abstains on domain age in the usual
+    way), and the domain-age signal is computed on a worker thread and
+    substituted in. Nothing else crosses a thread boundary.
+
+    Degradation stays per signal. A WHOIS timeout, a WHOIS failure, a broken
+    cache or a missing client all abstain on `domain_age_lt_7d` alone; the
+    other five are already computed by then and are returned regardless, so the
+    orchestrator still sees a completed Layer 1.
+
+    Omitting `whois_lookup` or `cache` uses the process defaults. Passing None
+    explicitly is not the same thing and is honoured: `whois_lookup=None`
+    abstains without looking anything up, and `cache=None` disables caching.
+    """
+    lookup = default_whois_lookup() if whois_lookup is _UNSET else whois_lookup
+
+    # `whois_lookup=None` is `analyze`'s own abstention path; there is nothing
+    # to offload, so do not pay for a thread to find that out.
+    if lookup is None:
+        return analyze(
+            source, whois_lookup=None, cache=None if cache is _UNSET else cache, now=now
+        )
+
+    if cache is _UNSET:
+        # Resolve the default cache only if there is something to cache.
+        # `analyze_domain_age` abstains without a lookup when the From address
+        # has no registrable domain, and opening a database to record that
+        # would be a side effect with nothing behind it.
+        store = default_cache() if registrable_domain(_parsed_email(source).from_addr) else None
+    else:
+        store = cache
+
+    signals = analyze(source, whois_lookup=None, cache=None, now=now)
+    age = await asyncio.to_thread(
+        analyze_domain_age, source, lookup=lookup, cache=store, now=now
+    )
+
+    # Substitute by name rather than by index: the position of the domain-age
+    # signal is `analyze`'s business, and this stays correct if it moves.
+    replaced = False
+    resolved: list[DetectionSignal] = []
+    for signal in signals:
+        if not replaced and signal.name == age.name:
+            resolved.append(age)
+            replaced = True
+        else:
+            resolved.append(signal)
+    if not replaced:
+        # `analyze` emitted no domain-age placeholder to swap. Append rather
+        # than drop a signal that was genuinely computed.
+        resolved.append(age)
+    return resolved

@@ -304,17 +304,19 @@ def test_a_failure_message_does_not_leak_the_registry_response():
     assert "ConnectionError" in signal.error
 
 
-def test_a_failure_is_negatively_cached_so_it_is_not_retried(cache):
-    lookup = FakeWhois(error=TimeoutError("rate limited"))
-    msg = email("a@ratelimited-domain.com")
+def test_a_genuine_negative_is_negatively_cached_so_it_is_not_retried(cache):
+    """The registry answered and recorded no date. That answer is worth keeping."""
+    lookup = FakeWhois(created=None)
+    msg = email("a@no-creation-date.com")
 
     first = analyze_domain_age(msg, lookup=lookup, cache=cache, now=NOW)
     second = analyze_domain_age(msg, lookup=lookup, cache=cache, now=NOW)
 
-    assert lookup.calls == ["ratelimited-domain.com"]  # the second call was suppressed
+    assert lookup.calls == ["no-creation-date.com"]  # the second call was suppressed
     assert first.error is not None and second.error is not None
     assert second.metadata["fired"] is False
-    assert "negative cache" in second.evidence
+    assert second.metadata["cached"] is True
+    assert second.metadata["authoritative"] is True
 
 
 def test_the_negative_cache_ttl_is_shorter_than_the_positive_one(cache, monkeypatch):
@@ -326,8 +328,8 @@ def test_the_negative_cache_ttl_is_shorter_than_the_positive_one(cache, monkeypa
     )
 
     analyze_domain_age(
-        email("a@ratelimited-domain.com"),
-        lookup=FakeWhois(error=TimeoutError("rate limited")),
+        email("a@no-creation-date.com"),
+        lookup=FakeWhois(created=None),
         cache=cache,
         now=NOW,
     )
