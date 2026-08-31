@@ -55,6 +55,52 @@ GOOGLE_HEADER = (
 
 
 # --------------------------------------------------------------------------
+# 0. ARC-Authentication-Results is deliberately not read
+# --------------------------------------------------------------------------
+#
+# `ingest.pipeline.AUTH_HEADERS` surfaces `ARC-Authentication-Results`, but
+# ARCHITECTURE.md section 4 specifies the three verdicts as read from
+# `Authentication-Results`, and this layer honours that. ARC records what some
+# *earlier* hop asserted, not what the receiving MTA concluded, and folding it
+# into `_worst()` would let an upstream forwarder's stale or forged verdict
+# decide a message the receiver itself authenticated. These tests pin the
+# existing behaviour so the omission stays a decision rather than drift.
+
+
+def test_arc_authentication_results_alone_does_not_produce_verdicts():
+    """An ARC-only message abstains; it does not inherit the upstream claim."""
+    email = email_with(
+        extra_headers=(
+            "ARC-Authentication-Results: i=1; mx.google.com; "
+            "spf=pass; dkim=pass; dmarc=pass\n"
+        )
+    )
+
+    assert parse_authentication_results(email) == {}
+    for signal in analyze_authentication_results(email):
+        assert signal.score == 0.0
+        assert signal.error is not None
+
+
+def test_an_arc_header_does_not_override_the_receivers_own_verdict():
+    """A failing ARC assertion cannot contaminate a receiver-recorded pass."""
+    email = email_with(
+        GOOGLE_HEADER,
+        extra_headers=(
+            "ARC-Authentication-Results: i=1; upstream.example; "
+            "spf=fail; dkim=fail; dmarc=fail\n"
+        ),
+    )
+
+    signals = signals_by_method(email)
+
+    for method in AUTH_METHODS:
+        assert signals[method].metadata["result"] == "pass"
+        assert signals[method].score == 0.0
+        assert signals[method].metadata["fired"] is False
+
+
+# --------------------------------------------------------------------------
 # 1. Contract shape
 # --------------------------------------------------------------------------
 

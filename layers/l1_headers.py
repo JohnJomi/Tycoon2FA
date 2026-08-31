@@ -56,6 +56,7 @@ import threading
 import unicodedata
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Protocol, runtime_checkable
 
 import tldextract
@@ -255,6 +256,16 @@ def _auth_result_headers(source: object) -> list[str]:
     occurrence. A bare `ParsedEmail` is read directly. Either way the result is
     the full list: a message legitimately carries several, and the disagreement
     between them is the thing worth seeing.
+
+    Only `Authentication-Results` is read. `auth_headers()` also surfaces
+    `ARC-Authentication-Results`, and that omission is deliberate:
+    ARCHITECTURE.md section 4 specifies the three verdicts as read from
+    `Authentication-Results`, and an ARC set records what an *earlier* hop
+    asserted rather than what the receiving MTA concluded. Because `_worst()`
+    takes the most severe result across everything collected, folding ARC in
+    would let a forwarder's stale or forged verdict decide a message the
+    receiver itself authenticated. Validating an ARC chain is a different
+    problem from reading a verdict, and this layer does not attempt it.
     """
     getter = getattr(source, "auth_headers", None)
     if callable(getter):
@@ -457,17 +468,53 @@ def analyze_authentication_results(
 # Registrable domains
 # --------------------------------------------------------------------------
 #
-# `tldextract` is configured with `suffix_list_urls=()`, so it uses its bundled
-# Public Suffix List snapshot and never touches the network. Layer 1 is an
-# offline layer apart from WHOIS, and a detection layer that silently fetches a
-# suffix list on first use is neither deterministic nor testable.
+# `tldextract` never touches the network here. Layer 1 is an offline layer
+# apart from WHOIS, and a detection layer that silently fetches a suffix list
+# on first use is neither deterministic nor testable.
+#
+# The suffix list it reads is the project's own vendored copy of the Public
+# Suffix List (`data/public_suffix_list.dat`), loaded through a `file://` URL -
+# tldextract mounts a file adapter for exactly this - with its disk cache
+# disabled so the file on disk is the only input. Vendoring the list rather
+# than relying on `suffix_list_urls=()` is what keeps the split *current*:
+# `suffix_list_urls=()` pins tldextract's bundled snapshot, which is frozen at
+# whatever the library shipped with and goes stale as registries delegate new
+# namespaces. A missing suffix is not a parse error - it silently reduces a
+# host to the wrong registrable domain, and every comparison built on it is
+# then wrong in a way nothing reports.
+#
+# `fallback_to_snapshot=True` keeps that a soft failure: an absent or
+# unreadable vendored file degrades to the bundled snapshot - the previous
+# behaviour - rather than breaking the layer.
+#
+# Refresh the vendored list from https://publicsuffix.org/list/public_suffix_list.dat.
 #
 # The PSL's private section is included, so user-content hosts split properly:
 # `attacker.github.io` and `victim.github.io` are different registrable domains
 # rather than one shared `github.io`, which is what a hosted phishing page on a
 # shared platform depends on being confused about.
 
-_EXTRACT = tldextract.TLDExtract(suffix_list_urls=(), include_psl_private_domains=True)
+PUBLIC_SUFFIX_LIST_PATH = (
+    Path(__file__).resolve().parent.parent / "data" / "public_suffix_list.dat"
+)
+
+
+def _build_extractor() -> tldextract.TLDExtract:
+    """The offline extractor, reading the vendored PSL when it is present."""
+    urls: tuple[str, ...] = ()
+    if PUBLIC_SUFFIX_LIST_PATH.is_file():
+        urls = (PUBLIC_SUFFIX_LIST_PATH.as_uri(),)
+    return tldextract.TLDExtract(
+        suffix_list_urls=urls,
+        fallback_to_snapshot=True,
+        include_psl_private_domains=True,
+        # The vendored file is the whole input; a disk cache keyed on its URL
+        # would let a stale parse outlive an updated file.
+        cache_dir=None,
+    )
+
+
+_EXTRACT = _build_extractor()
 
 
 def registrable_domain(value: str | None) -> str | None:

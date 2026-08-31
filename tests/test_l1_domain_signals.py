@@ -17,7 +17,9 @@ import pytest
 
 from core.models import DetectionLayer, ParsedEmail, RiskLevel
 from ingest.parser import parse_email
+from layers import l1_headers
 from layers.l1_headers import (
+    PUBLIC_SUFFIX_LIST_PATH,
     WHOIS_NEGATIVE_TTL_SECONDS,
     WHOIS_TTL_SECONDS,
     DomainAge,
@@ -83,6 +85,76 @@ def test_registrable_domain_returns_none_when_there_is_no_domain(value):
 
 
 # --------------------------------------------------------------------------
+# The vendored Public Suffix List
+# --------------------------------------------------------------------------
+#
+# Regression cover for a real-world miss found by the 10-message Gmail
+# validation: tldextract's *bundled* snapshot predates several delegated
+# second-level `.in` namespaces, so every host under one of them collapsed to
+# the namespace itself. `cx.federal.bank.in` reduced to `bank.in` - the
+# namespace every Indian bank shares - which is both a wrong From domain to
+# report and, worse, a domain two unrelated banks appear to have in common.
+#
+# These tests pin the *calculation*, not one bank: the vendored list is the
+# input, and the delegated namespaces are read from it rather than special
+# cased anywhere in the layer.
+
+
+def test_the_vendored_public_suffix_list_ships_with_the_project():
+    """The extractor's input is a file in the repo, not a library snapshot."""
+    assert PUBLIC_SUFFIX_LIST_PATH.is_file()
+    assert PUBLIC_SUFFIX_LIST_PATH.stat().st_size > 0
+
+
+@pytest.mark.parametrize(
+    "host,expected",
+    [
+        # Delegated second-level `.in` namespaces. None of these are special
+        # cased in the layer; they come from the vendored suffix list.
+        ("cx.federal.bank.in", "federal.bank.in"),
+        ("somebank.bank.in", "somebank.bank.in"),
+        ("mail.a-school.school.in", "a-school.school.in"),
+        ("x.some-firm.fin.in", "some-firm.fin.in"),
+        # The namespace itself is a public suffix, so there is nothing
+        # registrable to compare - "unknown", never a bare match.
+        ("bank.in", None),
+    ],
+)
+def test_delegated_second_level_in_namespaces_are_not_collapsed(host, expected):
+    assert registrable_domain(host) == expected
+    assert registrable_domain(f"someone@{host}") == expected
+
+
+@pytest.mark.parametrize(
+    "host,expected",
+    [
+        ("example.com", "example.com"),
+        ("sub.example.com", "example.com"),
+        ("example.co.in", "example.co.in"),
+        ("mail.example.co.in", "example.co.in"),
+        ("corp.co.uk", "corp.co.uk"),
+        ("attacker.github.io", "attacker.github.io"),
+    ],
+)
+def test_the_vendored_list_preserves_the_established_splits(host, expected):
+    """Refreshing the suffix list must not move any domain already handled."""
+    assert registrable_domain(host) == expected
+
+
+def test_a_missing_vendored_list_falls_back_instead_of_breaking_the_layer(
+    monkeypatch, tmp_path
+):
+    """An absent file degrades to the library snapshot - the previous behaviour."""
+    monkeypatch.setattr(
+        l1_headers, "PUBLIC_SUFFIX_LIST_PATH", tmp_path / "absent.dat"
+    )
+
+    extractor = l1_headers._build_extractor()
+
+    assert extractor("sub.example.com").top_domain_under_public_suffix == "example.com"
+
+
+# --------------------------------------------------------------------------
 # Reply-To vs From
 # --------------------------------------------------------------------------
 
@@ -129,6 +201,56 @@ def test_a_multi_part_suffix_is_not_confused_with_a_different_domain():
     )
 
     assert signal.metadata["fired"] is True
+
+
+def test_two_organizations_in_one_delegated_namespace_are_not_one_organization():
+    """The false *negative* the stale suffix list caused.
+
+    Under the bundled snapshot both sides reduced to `bank.in`, so a reply
+    redirected from one bank to an entirely different one read as "one
+    organization talking to itself" and the signal stayed silent.
+    """
+    signal = analyze_reply_to_mismatch(
+        email("Alpha Bank <alerts@cx.alpha.bank.in>", reply_to="a@beta.bank.in")
+    )
+
+    assert signal.metadata["from_domain"] == "alpha.bank.in"
+    assert signal.metadata["reply_to_domain"] == "beta.bank.in"
+    assert signal.metadata["fired"] is True
+
+
+def test_subdomains_within_one_delegated_namespace_registrant_do_not_fire():
+    """`alpha.bank.in` is one registrant; its own subdomains are one org."""
+    signal = analyze_reply_to_mismatch(
+        email("a@cx.alpha.bank.in", reply_to="b@care.alpha.bank.in")
+    )
+
+    assert signal.metadata["from_domain"] == "alpha.bank.in"
+    assert signal.metadata["reply_to_domain"] == "alpha.bank.in"
+    assert signal.metadata["fired"] is False
+
+
+def test_the_real_world_bank_in_case_reports_the_correct_from_domain():
+    """The message from the Gmail validation, reduced to its two headers.
+
+    The defect this pins is the *domain calculation*: `from_domain` must be the
+    sender's own registrable domain under the delegated namespace, not the
+    namespace itself.
+
+    The signal still fires, and that is the layer's documented semantics rather
+    than an oversight: a `.bank.in` registrant and a `.co.in` registrant are two
+    registrable domains, and `analyze_reply_to_mismatch` compares exactly that.
+    Recognising them as one organisation would need evidence this signal does
+    not consult - DMARC alignment, say - and inventing it here is out of scope.
+    """
+    signal = analyze_reply_to_mismatch(
+        email("Some Bank <no-reply@cx.somebank.bank.in>", reply_to="a@somebank.co.in")
+    )
+
+    assert signal.metadata["from_domain"] == "somebank.bank.in"
+    assert signal.metadata["reply_to_domain"] == "somebank.co.in"
+    assert signal.metadata["fired"] is True
+    assert signal.score == pytest.approx(0.55)
 
 
 def test_a_missing_reply_to_is_a_genuine_negative_not_an_abstention():
