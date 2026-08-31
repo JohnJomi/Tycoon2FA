@@ -723,6 +723,131 @@ class WhoisLookup(Protocol):
     def creation_date(self, domain: str) -> DomainAge: ...
 
 
+# --------------------------------------------------------------------------
+# Keeping the WHOIS client's idea of a domain the same as this layer's
+# --------------------------------------------------------------------------
+#
+# `python-whois` does its own public-suffix parsing before it queries anything:
+# `whois.whois(x)` calls `whois.extract_domain(x)` and looks up whatever *that*
+# returns. It reads its own bundled Public Suffix List copy, which is a
+# different file from this project's vendored one and lags it - so a host under
+# a delegated second-level namespace the client's list has not caught up with
+# is silently shortened to the namespace itself, and the record that comes back
+# describes the *parent*, not the domain that was asked about.
+#
+# Real validation caught this: a query for a bank's own registrant under a
+# delegated `.in` namespace returned the namespace's 2005 registration instead
+# of the registrant's 2025 one. The date is wrong in the dangerous direction -
+# a domain registered yesterday inherits a twenty-year-old creation date and
+# `domain_age_lt_7d` stays silent - and nothing in the response says so, since
+# the client reports success either way.
+#
+# Two independent defences, because they fail differently:
+#
+# 1. Seed the client's suffix set from the vendored list, so its extraction
+#    agrees with `registrable_domain` and the *right* domain is queried. This
+#    is what preserves the signal: without it every domain under a delegated
+#    namespace would merely abstain, and a week-old phishing domain there would
+#    never be detected.
+# 2. Verify identity anyway - before the call and after it. Seeding reaches
+#    into another library's module state and a future version could move it;
+#    verification does not depend on seeding having worked, and also catches
+#    the case where the *registry* answers about the parent. Neither hard-codes
+#    a namespace: both compare against the domain this layer asked for.
+#
+# A mismatch is `WhoisUnavailable`, never a result. Nothing was learned about
+# the requested domain, and the parent's date is exactly the thing that must
+# not be attributed to it.
+
+
+_suffix_seed: frozenset[bytes] | None = None
+_suffix_seed_lock = threading.Lock()
+
+
+def _vendored_suffix_seed() -> frozenset[bytes] | None:
+    """The vendored PSL in the byte-set form `python-whois` keeps it in.
+
+    Parsed exactly the way the client parses its own copy - every non-blank,
+    non-comment line, UTF-8 encoded - so seeding is a swap of the data, not a
+    change to how it is interpreted. Returns None if the file cannot be read;
+    the caller then leaves the client's own list alone.
+    """
+    global _suffix_seed
+    if _suffix_seed is not None:
+        return _suffix_seed or None
+    with _suffix_seed_lock:
+        if _suffix_seed is None:
+            try:
+                text = PUBLIC_SUFFIX_LIST_PATH.read_text(encoding="utf-8")
+            except OSError:
+                _suffix_seed = frozenset()
+            else:
+                _suffix_seed = frozenset(
+                    line.encode("utf-8")
+                    for line in text.splitlines()
+                    if line and not line.startswith("//")
+                )
+    return _suffix_seed or None
+
+
+def _align_whois_suffixes(whois_module: object) -> None:
+    """Point the client's domain extraction at the vendored suffix list.
+
+    Best effort by design: the client's suffix cache is its own module state,
+    so a version that renames or retypes it must not break the lookup. Failing
+    to seed only means the identity checks below do the work instead.
+    """
+    seed = _vendored_suffix_seed()
+    if seed is None:
+        return
+    try:
+        if getattr(whois_module, "suffixes", None) != seed:
+            whois_module.suffixes = set(seed)  # type: ignore[attr-defined]
+    except Exception:  # noqa: BLE001 - the client's internals are not a contract
+        pass
+
+
+def _normalized_domain(value: object) -> str | None:
+    """A comparable domain string, or None for anything that is not one."""
+    if not isinstance(value, str):
+        return None
+    candidate = value.strip().rstrip(".").lower()
+    return candidate or None
+
+
+def _would_query(whois_module: object, domain: str) -> str | None:
+    """The domain the client will actually look up, if it will say.
+
+    Asked *before* the call so a client that would query something else costs
+    no round trip. None means the question could not be put - an older or
+    newer client without the helper - and the answer is then checked instead.
+    """
+    extract = getattr(whois_module, "extract_domain", None)
+    if not callable(extract):
+        return None
+    try:
+        return _normalized_domain(extract(domain))
+    except Exception:  # noqa: BLE001 - untrusted third-party helper
+        return None
+
+
+def _record_domains(record: object) -> list[str]:
+    """Every domain name the record claims to describe, normalized.
+
+    A record legitimately carries a list - registries differ on case, and some
+    report several spellings - so all of them are returned and a match against
+    any one is a match. An empty list means the record named no domain at all.
+    """
+    try:
+        named = record.get("domain_name") if hasattr(record, "get") else None
+    except Exception:  # noqa: BLE001 - untrusted parsed record
+        named = None
+    if named is None:
+        named = getattr(record, "domain_name", None)
+    values = named if isinstance(named, (list, tuple, set)) else [named]
+    return [d for d in (_normalized_domain(v) for v in values) if d]
+
+
 class PythonWhoisLookup:
     """`python-whois` behind the `WhoisLookup` protocol.
 
@@ -737,10 +862,27 @@ class PythonWhoisLookup:
     response means the question never got answered. Only the first becomes a
     `DomainAge`; everything else is re-raised as `WhoisUnavailable` so no
     caller can mistake a transport failure for a fact about the domain.
+
+    It also holds the client to the domain it was asked about - see the
+    identity helpers above. A record describing the parent namespace is not an
+    answer about a delegated child, and is refused rather than misattributed.
     """
 
     def creation_date(self, domain: str) -> DomainAge:
         import whois  # noqa: PLC0415 - deliberately lazy, see docstring
+
+        requested = _normalized_domain(domain) or domain
+        _align_whois_suffixes(whois)
+
+        intended = _would_query(whois, domain)
+        if intended is not None and intended != requested:
+            # The client would look up a different domain - in practice the
+            # parent of a delegated namespace its suffix list does not know.
+            # Refused before the call: the answer could only describe something
+            # other than what was asked about.
+            raise WhoisUnavailable(
+                f"WHOIS client would query {intended} rather than {requested}"
+            )
 
         not_found = getattr(
             getattr(whois, "exceptions", None), "WhoisDomainNotFoundError", ()
@@ -756,6 +898,15 @@ class PythonWhoisLookup:
                 f"WHOIS lookup for {domain} could not be completed "
                 f"({type(exc).__name__})"
             ) from exc
+
+        named = _record_domains(record)
+        if named and requested not in named:
+            # The record is about some other domain - the parent namespace when
+            # the client shortened the query, or whatever the registry chose to
+            # answer with. Its dates are not this domain's dates.
+            raise WhoisUnavailable(
+                f"WHOIS returned a record for {named[0]}, not for {requested}"
+            )
 
         created = getattr(record, "creation_date", None)
         if isinstance(created, list):
