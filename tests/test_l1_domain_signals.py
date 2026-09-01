@@ -11,16 +11,22 @@ depends on today's date.
 
 from __future__ import annotations
 
+import sys
+import types
 from datetime import datetime, timedelta, timezone
 
 import pytest
 
 from core.models import DetectionLayer, ParsedEmail, RiskLevel
 from ingest.parser import parse_email
+from layers import l1_headers
 from layers.l1_headers import (
+    PUBLIC_SUFFIX_LIST_PATH,
     WHOIS_NEGATIVE_TTL_SECONDS,
     WHOIS_TTL_SECONDS,
     DomainAge,
+    PythonWhoisLookup,
+    WhoisUnavailable,
     analyze,
     analyze_display_name_impersonation,
     analyze_domain_age,
@@ -83,6 +89,76 @@ def test_registrable_domain_returns_none_when_there_is_no_domain(value):
 
 
 # --------------------------------------------------------------------------
+# The vendored Public Suffix List
+# --------------------------------------------------------------------------
+#
+# Regression cover for a real-world miss found by the 10-message Gmail
+# validation: tldextract's *bundled* snapshot predates several delegated
+# second-level `.in` namespaces, so every host under one of them collapsed to
+# the namespace itself. `cx.federal.bank.in` reduced to `bank.in` - the
+# namespace every Indian bank shares - which is both a wrong From domain to
+# report and, worse, a domain two unrelated banks appear to have in common.
+#
+# These tests pin the *calculation*, not one bank: the vendored list is the
+# input, and the delegated namespaces are read from it rather than special
+# cased anywhere in the layer.
+
+
+def test_the_vendored_public_suffix_list_ships_with_the_project():
+    """The extractor's input is a file in the repo, not a library snapshot."""
+    assert PUBLIC_SUFFIX_LIST_PATH.is_file()
+    assert PUBLIC_SUFFIX_LIST_PATH.stat().st_size > 0
+
+
+@pytest.mark.parametrize(
+    "host,expected",
+    [
+        # Delegated second-level `.in` namespaces. None of these are special
+        # cased in the layer; they come from the vendored suffix list.
+        ("cx.federal.bank.in", "federal.bank.in"),
+        ("somebank.bank.in", "somebank.bank.in"),
+        ("mail.a-school.school.in", "a-school.school.in"),
+        ("x.some-firm.fin.in", "some-firm.fin.in"),
+        # The namespace itself is a public suffix, so there is nothing
+        # registrable to compare - "unknown", never a bare match.
+        ("bank.in", None),
+    ],
+)
+def test_delegated_second_level_in_namespaces_are_not_collapsed(host, expected):
+    assert registrable_domain(host) == expected
+    assert registrable_domain(f"someone@{host}") == expected
+
+
+@pytest.mark.parametrize(
+    "host,expected",
+    [
+        ("example.com", "example.com"),
+        ("sub.example.com", "example.com"),
+        ("example.co.in", "example.co.in"),
+        ("mail.example.co.in", "example.co.in"),
+        ("corp.co.uk", "corp.co.uk"),
+        ("attacker.github.io", "attacker.github.io"),
+    ],
+)
+def test_the_vendored_list_preserves_the_established_splits(host, expected):
+    """Refreshing the suffix list must not move any domain already handled."""
+    assert registrable_domain(host) == expected
+
+
+def test_a_missing_vendored_list_falls_back_instead_of_breaking_the_layer(
+    monkeypatch, tmp_path
+):
+    """An absent file degrades to the library snapshot - the previous behaviour."""
+    monkeypatch.setattr(
+        l1_headers, "PUBLIC_SUFFIX_LIST_PATH", tmp_path / "absent.dat"
+    )
+
+    extractor = l1_headers._build_extractor()
+
+    assert extractor("sub.example.com").top_domain_under_public_suffix == "example.com"
+
+
+# --------------------------------------------------------------------------
 # Reply-To vs From
 # --------------------------------------------------------------------------
 
@@ -129,6 +205,56 @@ def test_a_multi_part_suffix_is_not_confused_with_a_different_domain():
     )
 
     assert signal.metadata["fired"] is True
+
+
+def test_two_organizations_in_one_delegated_namespace_are_not_one_organization():
+    """The false *negative* the stale suffix list caused.
+
+    Under the bundled snapshot both sides reduced to `bank.in`, so a reply
+    redirected from one bank to an entirely different one read as "one
+    organization talking to itself" and the signal stayed silent.
+    """
+    signal = analyze_reply_to_mismatch(
+        email("Alpha Bank <alerts@cx.alpha.bank.in>", reply_to="a@beta.bank.in")
+    )
+
+    assert signal.metadata["from_domain"] == "alpha.bank.in"
+    assert signal.metadata["reply_to_domain"] == "beta.bank.in"
+    assert signal.metadata["fired"] is True
+
+
+def test_subdomains_within_one_delegated_namespace_registrant_do_not_fire():
+    """`alpha.bank.in` is one registrant; its own subdomains are one org."""
+    signal = analyze_reply_to_mismatch(
+        email("a@cx.alpha.bank.in", reply_to="b@care.alpha.bank.in")
+    )
+
+    assert signal.metadata["from_domain"] == "alpha.bank.in"
+    assert signal.metadata["reply_to_domain"] == "alpha.bank.in"
+    assert signal.metadata["fired"] is False
+
+
+def test_the_real_world_bank_in_case_reports_the_correct_from_domain():
+    """The message from the Gmail validation, reduced to its two headers.
+
+    The defect this pins is the *domain calculation*: `from_domain` must be the
+    sender's own registrable domain under the delegated namespace, not the
+    namespace itself.
+
+    The signal still fires, and that is the layer's documented semantics rather
+    than an oversight: a `.bank.in` registrant and a `.co.in` registrant are two
+    registrable domains, and `analyze_reply_to_mismatch` compares exactly that.
+    Recognising them as one organisation would need evidence this signal does
+    not consult - DMARC alignment, say - and inventing it here is out of scope.
+    """
+    signal = analyze_reply_to_mismatch(
+        email("Some Bank <no-reply@cx.somebank.bank.in>", reply_to="a@somebank.co.in")
+    )
+
+    assert signal.metadata["from_domain"] == "somebank.bank.in"
+    assert signal.metadata["reply_to_domain"] == "somebank.co.in"
+    assert signal.metadata["fired"] is True
+    assert signal.score == pytest.approx(0.55)
 
 
 def test_a_missing_reply_to_is_a_genuine_negative_not_an_abstention():
@@ -189,6 +315,382 @@ class FakeWhois:
 def cache(tmp_path):
     with Cache(tmp_path / "l1.sqlite") as c:
         yield c
+
+
+# --------------------------------------------------------------------------
+# PythonWhoisLookup: the client is held to the domain it was asked about
+# --------------------------------------------------------------------------
+#
+# `python-whois` parses public suffixes with its own bundled list before it
+# queries anything, and that list lags the vendored one. Real validation caught
+# it answering a query for a bank's registrant under a delegated `.in`
+# namespace with the *namespace's* 2005 registration rather than the
+# registrant's 2025 one - a twenty-year-old creation date attached to a domain
+# that could have been registered yesterday.
+#
+# Every test here injects a fake `whois` module into `sys.modules`, which is
+# where `PythonWhoisLookup` imports it from. Nothing opens a socket.
+
+# The real-world case, as data. It is the regression scenario, not production
+# logic: nothing in layers/ knows these strings.
+DELEGATED_CHILD = "federal.bank.in"
+PARENT_NAMESPACE = "bank.in"
+PARENT_CREATED = datetime(2005, 2, 17, 5, 28, 51, tzinfo=timezone.utc)
+CHILD_CREATED = datetime(2025, 7, 18, 6, 12, 24, tzinfo=timezone.utc)
+
+
+class FakeRecord(dict):
+    """A stand-in for `whois.parser.WhoisEntry`, which is also a dict."""
+
+    def __getattr__(self, name):
+        try:
+            return self[name]
+        except KeyError as exc:  # pragma: no cover - mirrors the real class
+            raise AttributeError(name) from exc
+
+
+class FakeWhoisModule:
+    """A fake `python-whois`, including its own suffix-list behaviour.
+
+    `shortens_to` models the defect: a mapping from the domain asked for to the
+    (shorter) domain this client's own suffix list would reduce it to. When
+    `honours_seeding` is set - as the real client does, since seeding replaces
+    the list its extraction reads - the reduction stops happening once
+    `suffixes` has been populated from the vendored file.
+    """
+
+    def __init__(self, records, *, shortens_to=None, honours_seeding=True,
+                 has_extract=True):
+        self._records = records
+        self._shortens_to = dict(shortens_to or {})
+        self._honours_seeding = honours_seeding
+        self.suffixes = None
+        self.queried: list[str] = []
+        self.exceptions = types.SimpleNamespace(
+            WhoisDomainNotFoundError=_FakeNotFound
+        )
+        if not has_extract:
+            # A client that does not expose the helper: only the record's own
+            # identity can then give a mismatch away.
+            self.extract_domain = None
+
+    def _reduce(self, domain):
+        if self.suffixes and self._honours_seeding:
+            return domain
+        return self._shortens_to.get(domain, domain)
+
+    def extract_domain(self, domain):
+        return self._reduce(domain)
+
+    def whois(self, domain):
+        looked_up = self._reduce(domain)
+        self.queried.append(looked_up)
+        try:
+            return self._records[looked_up]
+        except KeyError:
+            raise _FakeNotFound(looked_up) from None
+
+
+class _FakeNotFound(Exception):
+    """Stands in for `whois.exceptions.WhoisDomainNotFoundError`."""
+
+
+def install_whois(monkeypatch, module):
+    monkeypatch.setitem(sys.modules, "whois", module)
+    return module
+
+
+def record(domain, created):
+    return FakeRecord(domain_name=domain, creation_date=created)
+
+
+def test_a_plain_com_domain_is_looked_up_and_returned(monkeypatch):
+    module = install_whois(
+        monkeypatch,
+        FakeWhoisModule({"example.com": record("example.com", PARENT_CREATED)}),
+    )
+
+    age = PythonWhoisLookup().creation_date("example.com")
+
+    assert module.queried == ["example.com"]
+    assert age.domain == "example.com"
+    assert age.created_at == PARENT_CREATED
+
+
+def test_a_multi_label_suffix_domain_is_looked_up_and_returned(monkeypatch):
+    """`example.co.in` is three labels too, and must keep working."""
+    module = install_whois(
+        monkeypatch,
+        FakeWhoisModule({"example.co.in": record("EXAMPLE.CO.IN", PARENT_CREATED)}),
+    )
+
+    age = PythonWhoisLookup().creation_date("example.co.in")
+
+    assert module.queried == ["example.co.in"]
+    assert age.created_at == PARENT_CREATED
+
+
+def test_the_client_is_seeded_so_the_delegated_child_is_the_domain_queried(
+    monkeypatch,
+):
+    """The fix that keeps the signal working: query the right domain."""
+    module = install_whois(
+        monkeypatch,
+        FakeWhoisModule(
+            {
+                DELEGATED_CHILD: record(DELEGATED_CHILD, CHILD_CREATED),
+                PARENT_NAMESPACE: record(PARENT_NAMESPACE, PARENT_CREATED),
+            },
+            shortens_to={DELEGATED_CHILD: PARENT_NAMESPACE},
+        ),
+    )
+
+    age = PythonWhoisLookup().creation_date(DELEGATED_CHILD)
+
+    assert module.queried == [DELEGATED_CHILD]
+    assert age.created_at == CHILD_CREATED
+    assert age.created_at != PARENT_CREATED
+
+
+def test_a_client_that_shortens_the_query_is_refused_before_it_is_called(
+    monkeypatch,
+):
+    """Seeding did not take - an older or changed client. Abstain, do not guess."""
+    module = install_whois(
+        monkeypatch,
+        FakeWhoisModule(
+            {PARENT_NAMESPACE: record(PARENT_NAMESPACE, PARENT_CREATED)},
+            shortens_to={DELEGATED_CHILD: PARENT_NAMESPACE},
+            honours_seeding=False,
+        ),
+    )
+
+    with pytest.raises(WhoisUnavailable):
+        PythonWhoisLookup().creation_date(DELEGATED_CHILD)
+
+    assert module.queried == []
+
+
+def test_a_record_describing_the_parent_namespace_is_refused(monkeypatch):
+    """The exact observed defect: asked about the child, answered about the parent.
+
+    The client reports success, so only the record's own identity gives it
+    away. `2005-02-17` must never come back as the child's creation date.
+    """
+    module = FakeWhoisModule(
+        {DELEGATED_CHILD: record(PARENT_NAMESPACE, PARENT_CREATED)},
+        has_extract=False,
+    )
+    install_whois(monkeypatch, module)
+
+    with pytest.raises(WhoisUnavailable) as raised:
+        PythonWhoisLookup().creation_date(DELEGATED_CHILD)
+
+    assert PARENT_NAMESPACE in str(raised.value)
+
+
+def test_the_parent_namespace_itself_is_still_answerable(monkeypatch):
+    """Refusing the mismatch must not refuse a genuine query for the parent."""
+    install_whois(
+        monkeypatch,
+        FakeWhoisModule({PARENT_NAMESPACE: record(PARENT_NAMESPACE, PARENT_CREATED)}),
+    )
+
+    age = PythonWhoisLookup().creation_date(PARENT_NAMESPACE)
+
+    assert age.created_at == PARENT_CREATED
+
+
+def test_a_record_naming_several_spellings_matches_on_any_of_them(monkeypatch):
+    install_whois(
+        monkeypatch,
+        FakeWhoisModule(
+            {
+                DELEGATED_CHILD: FakeRecord(
+                    domain_name=[DELEGATED_CHILD.upper(), DELEGATED_CHILD],
+                    creation_date=CHILD_CREATED,
+                )
+            }
+        ),
+    )
+
+    age = PythonWhoisLookup().creation_date(DELEGATED_CHILD)
+
+    assert age.created_at == CHILD_CREATED
+
+
+def test_a_record_naming_no_domain_at_all_is_refused(monkeypatch):
+    """Fail closed: an unconfirmable identity is not a confirmed one.
+
+    The dangerous shape is a record that carries a perfectly good creation date
+    while saying nothing about which domain it belongs to - in practice the
+    parent namespace's date, arriving from a client that shortened the query
+    and a parser that recorded no `domain_name` to give it away. Accepting it
+    because there is nothing to contradict it is exactly how the parent's date
+    gets attributed to the child.
+    """
+    install_whois(
+        monkeypatch,
+        FakeWhoisModule(
+            {
+                DELEGATED_CHILD: FakeRecord(
+                    domain_name=None, creation_date=PARENT_CREATED
+                )
+            },
+            has_extract=False,
+        ),
+    )
+
+    with pytest.raises(WhoisUnavailable) as raised:
+        PythonWhoisLookup().creation_date(DELEGATED_CHILD)
+
+    assert DELEGATED_CHILD in str(raised.value)
+
+
+def test_an_empty_domain_name_list_is_refused_too(monkeypatch):
+    """`domain_name=[]` is the same absence of evidence as None."""
+    install_whois(
+        monkeypatch,
+        FakeWhoisModule(
+            {"example.com": FakeRecord(domain_name=[], creation_date=PARENT_CREATED)}
+        ),
+    )
+
+    with pytest.raises(WhoisUnavailable):
+        PythonWhoisLookup().creation_date("example.com")
+
+
+def test_a_refused_record_yields_no_domain_age_at_all(monkeypatch):
+    """The refusal must not leak the parent's date through another path."""
+    install_whois(
+        monkeypatch,
+        FakeWhoisModule(
+            {
+                DELEGATED_CHILD: FakeRecord(
+                    domain_name=None, creation_date=PARENT_CREATED
+                )
+            },
+            has_extract=False,
+        ),
+    )
+
+    signal = analyze_domain_age(
+        email(f"a@{DELEGATED_CHILD}"),
+        lookup=PythonWhoisLookup(),
+        cache=None,
+        now=NOW,
+    )
+
+    assert signal.metadata["fired"] is False
+    assert signal.score == 0.0
+    assert signal.error is not None
+    assert signal.metadata["authoritative"] is False
+    assert "created_at" not in signal.metadata
+
+
+def test_a_registry_no_match_stays_a_genuine_negative(monkeypatch):
+    """Unchanged behaviour: "no such domain" is an answer, not a failure."""
+    install_whois(monkeypatch, FakeWhoisModule({}))
+
+    age = PythonWhoisLookup().creation_date("example.com")
+
+    assert age.domain == "example.com"
+    assert age.created_at is None
+
+
+def test_a_transport_failure_is_still_unavailable_not_a_negative(monkeypatch):
+    class Exploding(FakeWhoisModule):
+        def whois(self, domain):
+            raise OSError("connection reset")
+
+    install_whois(monkeypatch, Exploding({}))
+
+    with pytest.raises(WhoisUnavailable):
+        PythonWhoisLookup().creation_date("example.com")
+
+
+def test_a_record_without_a_creation_date_is_a_genuine_negative(monkeypatch):
+    install_whois(
+        monkeypatch,
+        FakeWhoisModule(
+            {"example.com": FakeRecord(domain_name="example.com", creation_date=None)}
+        ),
+    )
+
+    age = PythonWhoisLookup().creation_date("example.com")
+
+    assert age.created_at is None
+
+
+def test_a_malformed_creation_date_is_a_genuine_negative(monkeypatch):
+    install_whois(
+        monkeypatch,
+        FakeWhoisModule(
+            {
+                "example.com": FakeRecord(
+                    domain_name="example.com", creation_date="not a date"
+                )
+            }
+        ),
+    )
+
+    age = PythonWhoisLookup().creation_date("example.com")
+
+    assert age.created_at is None
+
+
+def test_the_vendored_suffix_seed_is_parsed_from_the_project_list():
+    """Seeding uses the vendored PSL, not a list of namespaces in the code."""
+    seed = l1_headers._vendored_suffix_seed()
+
+    assert seed is not None
+    assert b"com" in seed and b"co.in" in seed
+    # Present because the vendored list has it, not because anything names it.
+    assert PARENT_NAMESPACE.encode() in seed
+
+
+# --------------------------------------------------------------------------
+# The delegated-namespace case, end to end through analyze_domain_age
+# --------------------------------------------------------------------------
+
+
+def test_a_young_delegated_domain_fires_rather_than_inheriting_the_parent_age():
+    """The false negative this whole fix exists to close."""
+    lookup = FakeWhois(created=NOW - timedelta(days=1))
+
+    signal = analyze_domain_age(
+        email(f"alerts@cx.evil.{PARENT_NAMESPACE}"), lookup=lookup, now=NOW
+    )
+
+    assert lookup.calls == [f"evil.{PARENT_NAMESPACE}"]
+    assert signal.metadata["fired"] is True
+    assert signal.metadata["domain"] == f"evil.{PARENT_NAMESPACE}"
+
+
+def test_an_old_delegated_domain_stays_silent():
+    lookup = FakeWhois(created=NOW - timedelta(days=400))
+
+    signal = analyze_domain_age(
+        email(f"a@cx.{DELEGATED_CHILD}"), lookup=lookup, now=NOW
+    )
+
+    assert signal.metadata["domain"] == DELEGATED_CHILD
+    assert signal.metadata["fired"] is False
+    assert signal.error is None
+
+
+def test_a_refused_identity_abstains_rather_than_reporting_the_domain_old():
+    """An unusable WHOIS identity must not read as "checked, and it is old"."""
+    lookup = FakeWhois(error=WhoisUnavailable("record was for the parent namespace"))
+
+    signal = analyze_domain_age(
+        email(f"a@{DELEGATED_CHILD}"), lookup=lookup, now=NOW
+    )
+
+    assert signal.score == 0.0
+    assert signal.metadata["fired"] is False
+    assert signal.error is not None
+    assert signal.metadata["authoritative"] is False
 
 
 def test_a_domain_registered_days_ago_fires():
