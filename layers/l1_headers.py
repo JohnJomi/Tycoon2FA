@@ -836,7 +836,8 @@ def _record_domains(record: object) -> list[str]:
 
     A record legitimately carries a list - registries differ on case, and some
     report several spellings - so all of them are returned and a match against
-    any one is a match. An empty list means the record named no domain at all.
+    any one is a match. An empty list means the record named no domain at all,
+    which the caller treats as an unverifiable identity, not as agreement.
     """
     try:
         named = record.get("domain_name") if hasattr(record, "get") else None
@@ -865,7 +866,9 @@ class PythonWhoisLookup:
 
     It also holds the client to the domain it was asked about - see the
     identity helpers above. A record describing the parent namespace is not an
-    answer about a delegated child, and is refused rather than misattributed.
+    answer about a delegated child, and is refused rather than misattributed -
+    as is a record that does not name a domain at all, since an identity that
+    cannot be confirmed is not an identity that matches.
     """
 
     def creation_date(self, domain: str) -> DomainAge:
@@ -900,12 +903,21 @@ class PythonWhoisLookup:
             ) from exc
 
         named = _record_domains(record)
-        if named and requested not in named:
-            # The record is about some other domain - the parent namespace when
-            # the client shortened the query, or whatever the registry chose to
-            # answer with. Its dates are not this domain's dates.
+        if requested not in named:
+            # Fail closed: the record is accepted only when it says, itself,
+            # that it describes the domain that was asked about.
+            #
+            # A record naming some *other* domain is the parent namespace the
+            # client shortened to, or whatever the registry chose to answer
+            # with. A record naming *nothing* is no better - there is no
+            # evidence it describes the requested domain, and "unverifiable"
+            # has to read as "nothing was learned" rather than as consent.
+            # Either way its dates are not this domain's dates.
             raise WhoisUnavailable(
                 f"WHOIS returned a record for {named[0]}, not for {requested}"
+                if named
+                else f"WHOIS returned a record naming no domain, so it could "
+                f"not be confirmed to describe {requested}"
             )
 
         created = getattr(record, "creation_date", None)

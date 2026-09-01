@@ -519,18 +519,73 @@ def test_a_record_naming_several_spellings_matches_on_any_of_them(monkeypatch):
     assert age.created_at == CHILD_CREATED
 
 
-def test_a_record_naming_no_domain_at_all_is_still_accepted(monkeypatch):
-    """Many registries' parsers record no domain_name; that is not a mismatch."""
+def test_a_record_naming_no_domain_at_all_is_refused(monkeypatch):
+    """Fail closed: an unconfirmable identity is not a confirmed one.
+
+    The dangerous shape is a record that carries a perfectly good creation date
+    while saying nothing about which domain it belongs to - in practice the
+    parent namespace's date, arriving from a client that shortened the query
+    and a parser that recorded no `domain_name` to give it away. Accepting it
+    because there is nothing to contradict it is exactly how the parent's date
+    gets attributed to the child.
+    """
     install_whois(
         monkeypatch,
         FakeWhoisModule(
-            {"example.com": FakeRecord(domain_name=None, creation_date=PARENT_CREATED)}
+            {
+                DELEGATED_CHILD: FakeRecord(
+                    domain_name=None, creation_date=PARENT_CREATED
+                )
+            },
+            has_extract=False,
         ),
     )
 
-    age = PythonWhoisLookup().creation_date("example.com")
+    with pytest.raises(WhoisUnavailable) as raised:
+        PythonWhoisLookup().creation_date(DELEGATED_CHILD)
 
-    assert age.created_at == PARENT_CREATED
+    assert DELEGATED_CHILD in str(raised.value)
+
+
+def test_an_empty_domain_name_list_is_refused_too(monkeypatch):
+    """`domain_name=[]` is the same absence of evidence as None."""
+    install_whois(
+        monkeypatch,
+        FakeWhoisModule(
+            {"example.com": FakeRecord(domain_name=[], creation_date=PARENT_CREATED)}
+        ),
+    )
+
+    with pytest.raises(WhoisUnavailable):
+        PythonWhoisLookup().creation_date("example.com")
+
+
+def test_a_refused_record_yields_no_domain_age_at_all(monkeypatch):
+    """The refusal must not leak the parent's date through another path."""
+    install_whois(
+        monkeypatch,
+        FakeWhoisModule(
+            {
+                DELEGATED_CHILD: FakeRecord(
+                    domain_name=None, creation_date=PARENT_CREATED
+                )
+            },
+            has_extract=False,
+        ),
+    )
+
+    signal = analyze_domain_age(
+        email(f"a@{DELEGATED_CHILD}"),
+        lookup=PythonWhoisLookup(),
+        cache=None,
+        now=NOW,
+    )
+
+    assert signal.metadata["fired"] is False
+    assert signal.score == 0.0
+    assert signal.error is not None
+    assert signal.metadata["authoritative"] is False
+    assert "created_at" not in signal.metadata
 
 
 def test_a_registry_no_match_stays_a_genuine_negative(monkeypatch):
