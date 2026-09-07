@@ -61,6 +61,7 @@ from typing import Protocol, Sequence, runtime_checkable
 from urllib.parse import parse_qsl, urlsplit
 
 from core.models import (
+    Attachment,
     DetectionLayer,
     DetectionSignal,
     ExtractedURL,
@@ -72,6 +73,11 @@ from layers.l1_headers import BRAND_DOMAINS, registrable_domain
 
 __all__ = [
     "BASE64_EMAIL_PARAM_SCORE",
+    "QRDecodeResult",
+    "QRDecoder",
+    "QROutcome",
+    "QRPayload",
+    "QR_IMAGE_CONTENT_TYPES",
     "CHALLENGE_MARKERS",
     "ChallengeEvidence",
     "ChallengeKind",
@@ -1504,3 +1510,224 @@ class PageRenderer(Protocol):
     """
 
     def render(self, url: str) -> RenderResult: ...
+
+
+# --------------------------------------------------------------------------
+# The QR decode contract (l2.qr_url)
+# --------------------------------------------------------------------------
+#
+# ARCHITECTURE.md section 4: "`pyzbar` decode of image attachments + inline
+# images; extracted URL re-enters the URL signal set." Section 4 also calls
+# this the differentiator - per the research doc it is Tycoon's primary SEG
+# bypass - so the contract is worth getting right before any decoding happens.
+#
+# **This is the record and the seam only. Nothing here decodes an image**, and
+# `pyzbar` is not a dependency of this project yet.
+#
+# Where the image bytes come from
+# -------------------------------
+# `core.models.Attachment` is metadata only, and section 2 says so on purpose:
+# "The payload is deliberately not carried on the contract." That is not an
+# oversight to work around and **this module does not add bytes to it**.
+#
+# So the decoder is handed the payload as an argument alongside the attachment
+# it belongs to: `decode(payload, attachment)`. The bytes themselves come from
+# the ingest boundary, which is the only part of the system that has them -
+# `ParsedEmail.raw` carries the original RFC-822 message when a source
+# provided it, and `ingest/parser.py` already walks that tree to build the
+# attachment list. Resolving one attachment back to its bytes is a small
+# addition *there*, and is deliberately not designed here: it is an ingest
+# concern, it is the piece this contract is waiting on, and inventing a second
+# payload path in Layer 2 would give the project two disagreeing ideas of what
+# an attachment's content is.
+#
+# Untrusted input
+# ---------------
+# A decoded QR payload is attacker-controlled text of arbitrary content. It is
+# stored verbatim and **never dereferenced**: the decoder does not fetch it,
+# resolve it, or validate it as a URL. Filtering happens where it already
+# happens - `candidate_urls(..., extra=...)`, which drops anything that is not
+# an analysable http(s) URL. `as_extracted_urls` below is the bridge, and it
+# does no validation of its own.
+
+# The content types worth handing to a decoder, recorded from section 4's
+# "image attachments + inline images". A part that is not an image is not a
+# decode failure - it is not a decode attempt at all.
+QR_IMAGE_CONTENT_TYPES = frozenset(
+    {"image/png", "image/jpeg", "image/jpg", "image/gif", "image/bmp", "image/webp", "image/tiff"}
+)
+
+
+class QROutcome(str, Enum):
+    """What happened to one decode attempt.
+
+    Note what is *not* here: "found a URL" is not an outcome. A decoded symbol
+    is a property of an image that was successfully read, so it lives in
+    `QRDecodeResult.payloads`, and `DECODED` covers both an image carrying a QR
+    code and one carrying none. Splitting them would put "no QR in this image"
+    and "this image could not be read" next to each other as sibling values,
+    which is the confusion the contract exists to prevent.
+    """
+
+    # The image was read and inspected. `payloads` is meaningful: empty means
+    # the image genuinely carried no decodable symbol.
+    DECODED = "decoded"
+
+    # Not an image this decoder handles - a PDF, a spreadsheet, an unknown
+    # content type. Not a failure: there was nothing to decode.
+    UNSUPPORTED = "unsupported"
+
+    # An image that could not be read: truncated, corrupt, or in a format the
+    # decoder recognized but could not open.
+    UNREADABLE = "unreadable"
+
+    # The decoder bounded itself and gave up. **Not mandated by section 4** -
+    # the spec sets timeouts for redirect hops, not for decoding - but a seam
+    # that cannot express "I stopped early" would force a decoder to lie about
+    # a very large image. See the report.
+    TIMED_OUT = "timed_out"
+
+    # No decoder configured, or no payload available for the attachment.
+    # Nothing was tried.
+    NOT_ATTEMPTED = "not_attempted"
+
+    @property
+    def is_answer(self) -> bool:
+        """True when the result says something about the image."""
+        return self is QROutcome.DECODED
+
+
+@dataclass(frozen=True)
+class QRPayload:
+    """One decoded symbol, exactly as the decoder returned it.
+
+    `data` is verbatim attacker-controlled text - not stripped, not decoded
+    further, not checked to be a URL. `symbol` is the barcode type the decoder
+    reported (`QRCODE`, `DATAMATRIX`, ...) where it reported one, so evidence
+    can say a QR code was read rather than "a barcode".
+    """
+
+    data: str
+    symbol: str | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.data, str):
+            raise TypeError(f"data must be a str, got {type(self.data).__name__}")
+        if not self.data:
+            # An empty payload is not a decoded symbol; a decoder reporting one
+            # has malfunctioned, and recording it would put an empty string
+            # into the candidate set.
+            raise ValueError("a decoded payload must not be empty")
+
+
+@dataclass(frozen=True)
+class QRDecodeResult:
+    """The result of attempting to decode one attachment. Immutable.
+
+    Held beside the `ParsedEmail`, never inside it: `Attachment` is referenced
+    for provenance and is not modified, and nothing here writes to the parsed
+    message.
+
+    `payloads` is meaningful **only** when the outcome is `DECODED`. An empty
+    tuple there is a genuine "this image carries no QR code"; an empty tuple is
+    the only possibility on every other outcome, because the contract rejects
+    anything else - which is what stops a corrupt image from being read as an
+    image with nothing in it.
+    """
+
+    attachment: Attachment
+    outcome: QROutcome
+    payloads: tuple[QRPayload, ...] = ()
+    error: str | None = None
+    elapsed_ms: int = 0
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.attachment, Attachment):
+            raise TypeError(
+                f"attachment must be an Attachment, got {type(self.attachment).__name__}"
+            )
+        if not isinstance(self.outcome, QROutcome):
+            raise TypeError(f"outcome must be a QROutcome, got {type(self.outcome).__name__}")
+        if self.outcome.is_answer:
+            if self.error is not None:
+                raise ValueError("a decoded result must not carry an error")
+        else:
+            if not self.error:
+                raise ValueError(f"a {self.outcome.value} result must state why")
+            if self.payloads:
+                raise ValueError(
+                    f"a {self.outcome.value} result read no image, so it cannot "
+                    f"report payloads"
+                )
+        if self.elapsed_ms < 0:
+            raise ValueError(f"elapsed_ms must not be negative, got {self.elapsed_ms}")
+
+    @property
+    def is_answer(self) -> bool:
+        """True when this result says something about the image."""
+        return self.outcome.is_answer
+
+    @property
+    def found_any(self) -> bool:
+        """True only for an image that was read and carried a symbol.
+
+        False for a failed decode too - so this must never be read on its own
+        as "this image is clean". Check `is_answer` first.
+        """
+        return self.is_answer and bool(self.payloads)
+
+    @property
+    def provenance(self) -> dict[str, object]:
+        """Which attachment this result describes, for evidence and metadata."""
+        return {
+            "filename": self.attachment.filename,
+            "content_type": self.attachment.content_type,
+            "content_id": self.attachment.content_id,
+            "inline": self.attachment.is_inline,
+        }
+
+    def as_extracted_urls(self) -> list[ExtractedURL]:
+        """Decoded payloads as `ExtractedURL`s for `candidate_urls(extra=...)`.
+
+        The re-entry bridge section 4 asks for: "extracted URL re-enters the
+        URL signal set". Every payload is passed through verbatim under
+        `URLSource.QR_CODE` and **nothing is validated here** - a payload that
+        is not an analysable http(s) URL is dropped by `candidate_urls`, which
+        is where that judgement already lives. A failed decode yields nothing,
+        so a decoder outage can never inject anything into the candidate set.
+        """
+        return [
+            ExtractedURL(url=payload.data, source=URLSource.QR_CODE)
+            for payload in self.payloads
+        ]
+
+    @classmethod
+    def not_attempted(cls, attachment: Attachment, reason: str) -> QRDecodeResult:
+        """A result for an attachment nothing tried to decode.
+
+        The state this repository is in: `pyzbar` is not installed, no decoder
+        exists, and `Attachment` carries no bytes to give one.
+        """
+        return cls(attachment=attachment, outcome=QROutcome.NOT_ATTEMPTED, error=reason)
+
+
+@runtime_checkable
+class QRDecoder(Protocol):
+    """The whole of what Layer 2 requires of a QR decoder.
+
+    The payload is passed in rather than fetched, because `Attachment` does not
+    carry bytes and section 2 says it deliberately never will - see the module
+    note above on where the bytes come from.
+
+    Total and non-raising, like `RedirectFollower` and `PageRenderer`: an
+    implementation returns a `QRDecodeResult` for every input, because a
+    corrupt image is a fact worth recording and an exception would discard the
+    attachment's identity along with it.
+
+    An implementation must not dereference what it decodes. A QR payload is
+    untrusted text; decoding it is the whole job, and fetching it would mean
+    this layer visiting attacker infrastructure from wherever it happens to
+    run - which section 4 forbids in the strongest terms it uses anywhere.
+    """
+
+    def decode(self, payload: bytes, attachment: Attachment) -> QRDecodeResult: ...
