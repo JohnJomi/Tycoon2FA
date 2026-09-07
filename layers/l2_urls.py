@@ -72,6 +72,12 @@ from layers.l1_headers import BRAND_DOMAINS, registrable_domain
 
 __all__ = [
     "BASE64_EMAIL_PARAM_SCORE",
+    "CHALLENGE_MARKERS",
+    "ChallengeEvidence",
+    "ChallengeKind",
+    "PageRenderer",
+    "RenderOutcome",
+    "RenderResult",
     "BRAND_MISMATCH_SCORE",
     "DEFAULT_PORTS",
     "REDIRECT_CAPPED_SCORE",
@@ -1271,3 +1277,230 @@ def _brand_signal(
         metadata={**metadata, "fired": score > 0.0 and error is None},
         error=error,
     )
+
+
+# --------------------------------------------------------------------------
+# The render result contract (l2.captcha_gate)
+# --------------------------------------------------------------------------
+#
+# ARCHITECTURE.md section 4: "Playwright render of terminal URL; detect
+# Turnstile/hCaptcha/reCAPTCHA in DOM."
+#
+# **This is the record and the seam only. Nothing here renders anything, and
+# no detection is implemented.** Rendering is the most dangerous thing this
+# project does - it executes an attacker's JavaScript - and section 4 puts it
+# behind restricted-network Docker with egress via a VPS or VPN, none of which
+# exists in this repository yet. Establishing the contract first is what lets
+# the signal be written and tested with fakes while that infrastructure is
+# still missing.
+#
+# Why "the terminal URL". The signal renders where the redirect chain ends, not
+# the link in the message: a Tycoon-style kit puts its Turnstile gate on the
+# landing page, several hops in. So this seam is fed a `RedirectTrace.final_url`
+# - which is `None` for every non-answer outcome, so a chain that could not be
+# followed yields nothing to render, and the future signal abstains rather than
+# rendering the wrong page.
+#
+# The captcha gate is a *phishing* indicator, not a safety feature: a login
+# page that puts Cloudflare Turnstile in front of a Microsoft-branded form is
+# keeping automated scanners out, which is exactly why it matters. Detection
+# semantics are recorded below and deliberately not implemented.
+
+
+class ChallengeKind(str, Enum):
+    """The challenge types ARCHITECTURE.md section 4 names, and only those.
+
+    Three, because the spec lists three. No `OTHER` member: a detector that
+    could report "some challenge I could not identify" would be making a claim
+    the spec does not define and that no evidence string could justify.
+    """
+
+    TURNSTILE = "turnstile"
+    HCAPTCHA = "hcaptcha"
+    RECAPTCHA = "recaptcha"
+
+
+# What the future detector looks for, recorded from section 4 as a design
+# requirement and **not implemented**. Each kind maps to the markers a rendered
+# DOM would have to contain; the detector that reads this is a later change,
+# and the values here are documentation of intent, deliberately not wired to
+# anything. They are the vendor-published widget markers, not guesses about
+# attacker behaviour.
+CHALLENGE_MARKERS: dict[ChallengeKind, tuple[str, ...]] = {
+    ChallengeKind.TURNSTILE: ("challenges.cloudflare.com/turnstile", "cf-turnstile"),
+    ChallengeKind.HCAPTCHA: ("hcaptcha.com/1/api.js", "h-captcha"),
+    ChallengeKind.RECAPTCHA: ("google.com/recaptcha/api.js", "g-recaptcha"),
+}
+
+
+class RenderOutcome(str, Enum):
+    """What happened to the render attempt.
+
+    Note what is *not* here: "captcha found" is not an outcome. A challenge is
+    a property of a page that rendered, so it lives in `RenderResult.challenges`
+    and `RENDERED` covers both a gated page and an ordinary one. Modelling them
+    as sibling outcomes would make "no captcha" and "no render" adjacent values
+    of one enum, which is precisely the confusion this contract exists to
+    prevent.
+
+    `is_answer` is the one predicate a caller needs, so no caller has to
+    enumerate the failing set correctly.
+    """
+
+    # The page loaded and its DOM was inspected. The challenge list is
+    # meaningful - empty means genuinely no challenge was present.
+    RENDERED = "rendered"
+
+    # The page could not be loaded: DNS failure, refused connection, TLS
+    # failure, an HTTP error the renderer could not present, a crashed context.
+    UNREACHABLE = "unreachable"
+
+    # Section 10: "Playwright hangs on attacker page -> hard timeout, kill
+    # context". A page that never settled is not a page without a captcha.
+    TIMED_OUT = "timed_out"
+
+    # No renderer configured, no sandboxed egress, or no terminal URL to
+    # render because the redirect chain never produced one. Nothing was tried.
+    NOT_ATTEMPTED = "not_attempted"
+
+    @property
+    def is_answer(self) -> bool:
+        """True when the result says something about the page."""
+        return self is RenderOutcome.RENDERED
+
+
+@dataclass(frozen=True)
+class ChallengeEvidence:
+    """One challenge widget observed in a rendered DOM.
+
+    `marker` is the string that was actually matched - a script URL or a class
+    name - because "a captcha was detected" is not evidence and section 2
+    requires the UI to be able to show why. `detail` is optional context such
+    as the site key or the element's selector.
+    """
+
+    kind: ChallengeKind
+    marker: str
+    detail: str | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.kind, ChallengeKind):
+            raise TypeError(f"kind must be a ChallengeKind, got {type(self.kind).__name__}")
+        if not self.marker or not self.marker.strip():
+            raise ValueError("marker must not be empty: a finding needs its evidence")
+
+
+@dataclass(frozen=True)
+class RenderResult:
+    """The result of rendering one URL. Immutable.
+
+    Held beside a `URLCandidate` and a `RedirectTrace`, never inside either:
+    like `RedirectTrace`, this is an observation *about* a URL, and the parsed
+    message stays untouched.
+
+    `url` is the URL that was rendered - the terminal URL, preserved exactly as
+    it was handed in. `final_url` is where the page ended up after any in-page
+    navigation, and is None unless the page rendered.
+
+    `challenges` is meaningful **only** when the outcome is `RENDERED`. An
+    empty tuple on a rendered page is a genuine "no challenge here"; an empty
+    tuple is impossible to reach on any other outcome, because the contract
+    rejects it - which is what stops a browser failure from being read as a
+    clean page.
+
+    `error` is set when and only when the outcome is not an answer, the same
+    role it has on `DetectionSignal` and `RedirectTrace`.
+    """
+
+    url: str
+    outcome: RenderOutcome
+    challenges: tuple[ChallengeEvidence, ...] = ()
+    final_url: str | None = None
+    status_code: int | None = None
+    title: str | None = None
+    error: str | None = None
+    elapsed_ms: int = 0
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.outcome, RenderOutcome):
+            raise TypeError(
+                f"outcome must be a RenderOutcome, got {type(self.outcome).__name__}"
+            )
+        if not self.url or not self.url.strip():
+            raise ValueError("url must not be empty")
+        if self.outcome.is_answer:
+            if self.error is not None:
+                raise ValueError("a rendered page must not carry an error")
+        else:
+            # The invariant that keeps a browser failure from reading as a
+            # page with no captcha on it.
+            if not self.error:
+                raise ValueError(f"a {self.outcome.value} result must state why")
+            if self.challenges:
+                raise ValueError(
+                    f"a {self.outcome.value} result has no DOM, so it cannot "
+                    f"report challenges"
+                )
+            if self.final_url is not None or self.status_code is not None:
+                raise ValueError(f"a {self.outcome.value} result has no page")
+        if self.elapsed_ms < 0:
+            raise ValueError(f"elapsed_ms must not be negative, got {self.elapsed_ms}")
+
+    @property
+    def is_answer(self) -> bool:
+        """True when this result says something about the page."""
+        return self.outcome.is_answer
+
+    @property
+    def has_challenge(self) -> bool:
+        """True only for a rendered page that carried a challenge widget.
+
+        False for a failed render too - so this must never be read on its own
+        as "the page is clean". Check `is_answer` first; the future signal
+        abstains when it is False.
+        """
+        return self.is_answer and bool(self.challenges)
+
+    @property
+    def kinds(self) -> tuple[ChallengeKind, ...]:
+        """The distinct challenge kinds found, in first-seen order."""
+        seen: list[ChallengeKind] = []
+        for challenge in self.challenges:
+            if challenge.kind not in seen:
+                seen.append(challenge.kind)
+        return tuple(seen)
+
+    @classmethod
+    def not_attempted(cls, url: str, reason: str) -> RenderResult:
+        """A result for a URL nothing tried to render.
+
+        The state this repository is in: there is no renderer, no Docker
+        sandbox and no egress, so this is what `l2.captcha_gate` will read and
+        abstain on rather than reporting every landing page as ungated.
+        """
+        return cls(url=url, outcome=RenderOutcome.NOT_ATTEMPTED, error=reason)
+
+
+@runtime_checkable
+class PageRenderer(Protocol):
+    """The one browser-touching seam in Layer 2. No implementation ships here.
+
+    Same shape as `RedirectFollower`, and total for the same reason: an
+    implementation returns a `RenderResult` for every URL and **must not
+    raise**, because a render that failed halfway is still a fact worth
+    recording and an exception would discard it.
+
+    An implementation must honour the section 4 safety rules, none of which
+    this module can enforce for it:
+
+      - Playwright runs in Docker with `--network` restricted and no host
+        mount; egress via a VPS or VPN, never a home or campus IP.
+      - `accept_downloads=False` - never execute downloads.
+      - A hard timeout that kills the browser context, per section 10's
+        "Playwright hangs on attacker page" row.
+
+    It renders the URL it is given and nothing else: no crawling, no following
+    of in-page links, no fetching of anything the page did not need to display.
+    """
+
+    def render(self, url: str) -> RenderResult: ...
