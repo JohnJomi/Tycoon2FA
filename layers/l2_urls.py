@@ -52,6 +52,9 @@ definition, and a parser that improvises on it produces confident nonsense.
 
 from __future__ import annotations
 
+import base64
+import binascii
+import re
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Protocol, Sequence, runtime_checkable
@@ -68,6 +71,7 @@ from core.models import (
 from layers.l1_headers import registrable_domain
 
 __all__ = [
+    "BASE64_EMAIL_PARAM_SCORE",
     "DEFAULT_PORTS",
     "REDIRECT_CAPPED_SCORE",
     "REDIRECT_DEPTH_SCORE",
@@ -78,7 +82,9 @@ __all__ = [
     "RedirectOutcome",
     "RedirectTrace",
     "URLCandidate",
+    "analyze_base64_email_param",
     "analyze_redirect_depth",
+    "decode_base64_email",
     "candidate_urls",
     "canonical_form",
     "parse_url",
@@ -752,4 +758,262 @@ def analyze_redirect_depth(
         f"All {len(candidates)} URL(s) in this message settle within "
         f"{REDIRECT_FLAG_DEPTH} redirect(s); the longest chain is {deepest}.",
         metadata=metadata,
+    )
+
+
+# --------------------------------------------------------------------------
+# l2.base64_email_param
+# --------------------------------------------------------------------------
+#
+# ARCHITECTURE.md section 4: "Regex for base64-encoded address in
+# query/fragment; decode and confirm it parses as an email."
+#
+# Why this is worth a signal at all: a phishing link that already knows who it
+# was sent to is a link built for one recipient. Tycoon-style kits carry the
+# victim's address in the URL so the landing page can pre-fill the login form,
+# which is both what makes the page convincing and what makes the link
+# self-identifying. A legitimate marketing tracker encodes an opaque
+# subscriber id, not a decodable mailbox.
+#
+# The spec's own false-positive control is the second half of the sentence:
+# **decode and confirm it parses as an email**. Arbitrary base64 is ordinary in
+# URLs - session tokens, encoded return paths, cache keys - so the finding is
+# not "this looks encoded", it is "this decodes to an address". Nothing here
+# fires on base64 alone.
+#
+# Entirely offline: string work over `URLCandidate` fields. No DNS, no request,
+# and in particular no attempt to verify the decoded address exists.
+
+# The base64 alphabet as it appears in a URL parameter. Standard alphabet only
+# - `+/=` - because that is what section 4 says and nothing in this project
+# requires the URL-safe `-_` variant. Padding arrives already percent-decoded
+# by `parse_qsl`, so `%3D` is an `=` by the time it is seen here.
+#
+# The 12-character floor is not a heuristic about suspiciousness: it is the
+# shortest input that can decode to anything email-shaped at all. The shortest
+# plausible address is `a@b.co` at 6 bytes, which is 8 base64 characters, and
+# 12 characters decode to 9 bytes - below that the regex cannot match a string
+# that survives the email check anyway, and matching shorter would only mean
+# decoding more noise to throw it away.
+_BASE64_CANDIDATE_RE = re.compile(r"^[A-Za-z0-9+/]{12,}={0,2}$")
+
+# The decoded value must parse as one address. Deliberately strict and
+# deliberately not an RFC 5322 implementation: `email.utils.parseaddr` accepts
+# a great deal that is not an address, so the shape is checked explicitly and
+# the registrable domain must resolve against the vendored public suffix list,
+# which is the same bar `l1.replyto_mismatch` applies. `x@localhost` and
+# `a@b` therefore do not count, and neither does a sentence containing an `@`.
+_DECODED_EMAIL_RE = re.compile(r"^[^\s@<>\"',;:\\]{1,64}@[A-Za-z0-9.-]{1,255}$")
+
+# **Not specified by ARCHITECTURE.md.** Section 4 names the method for every
+# signal but assigns a score to none of them, and config/weights.yaml carries
+# layer weights and verdict bands only - no per-signal values. This number is
+# therefore hand-assigned for Phase A on the same terms as every other score in
+# this project (`_FAIL_SCORES` in Layer 1, `URL_IOC_SCORE` in Layer 4), and is
+# refitted in Phase 5 against the labelled corpus.
+#
+# Placed at 0.70 - above `l2.redirect_depth`'s 0.55, below a confirmed
+# threat-intel listing's 0.95. A link that carries the recipient's own address
+# is close to conclusive evidence of targeting, but it is not proof of intent:
+# some legitimate unsubscribe and preference-centre links do exactly this,
+# which is precisely why it is not scored higher.
+BASE64_EMAIL_PARAM_SCORE = 0.70
+
+
+@dataclass(frozen=True)
+class _EncodedAddress:
+    """One decoded hit: where it was found, what it decoded to."""
+
+    location: str  # "query" or "fragment"
+    parameter: str | None  # None when the whole fragment carried the value
+    encoded: str
+    email: str
+
+
+def decode_base64_email(value: str) -> str | None:
+    """Decode `value` and return the email address it holds, or None.
+
+    None - never an exception - for everything that is not the thing section 4
+    describes: a value that is not base64-shaped, base64 that will not decode,
+    bytes that are not UTF-8 text, and text that is not a single address on a
+    domain with a public suffix. That last check is what stops arbitrary
+    decodable base64 from becoming a finding.
+    """
+    if not isinstance(value, str):
+        return None
+    candidate = value.strip()
+    if not _BASE64_CANDIDATE_RE.match(candidate):
+        return None
+
+    try:
+        raw = base64.b64decode(candidate, validate=True)
+    except (binascii.Error, ValueError):
+        return None
+
+    try:
+        decoded = raw.decode("utf-8").strip()
+    except UnicodeDecodeError:
+        return None
+
+    if not _DECODED_EMAIL_RE.match(decoded):
+        return None
+    # An address whose domain has no public suffix is not one this project
+    # treats as an address anywhere else - the same rule Layer 1 applies.
+    if registrable_domain(decoded) is None:
+        return None
+    return decoded
+
+
+def _encoded_addresses(candidate: URLCandidate) -> list[_EncodedAddress]:
+    """Every decodable address carried by one URL's query and fragment.
+
+    Both surfaces are inspected because section 4 names both. Values come from
+    the already-parsed `query_params` / `fragment_params`, so a blank parameter
+    stays visible as a present-but-empty value rather than vanishing - it
+    simply cannot decode to anything.
+
+    The bare fragment is inspected too, always: a kit that appends
+    `#dGVzdEBleGFtcGxlLmNvbQ==` is putting the address in the fragment exactly
+    as the spec describes. It is reported with `parameter: None` so evidence
+    can say where it was. Note that base64 padding is an `=`, so such a
+    fragment *also* parses as a one-entry parameter list with a blank value -
+    which decodes to nothing, so the bare check is what actually finds it and
+    no hit is reported twice.
+    """
+    found: list[_EncodedAddress] = []
+
+    for location, params in (
+        ("query", candidate.query_params),
+        ("fragment", candidate.fragment_params),
+    ):
+        for name, value in params:
+            email = decode_base64_email(value)
+            if email is not None:
+                found.append(
+                    _EncodedAddress(
+                        location=location, parameter=name, encoded=value, email=email
+                    )
+                )
+
+    # Always, not only when the fragment held no parameters: base64 padding is
+    # itself an `=`, so `#dGhpcmRAY29ycC5jb20=` parses as a parameter list with
+    # one blank value *and* is a bare encoded address. Checking only one of the
+    # two would miss whichever case the padding happened to produce.
+    if candidate.fragment:
+        email = decode_base64_email(candidate.fragment)
+        if email is not None:
+            found.append(
+                _EncodedAddress(
+                    location="fragment",
+                    parameter=None,
+                    encoded=candidate.fragment.strip(),
+                    email=email,
+                )
+            )
+
+    return found
+
+
+def analyze_base64_email_param(
+    email: ParsedEmail,
+    *,
+    extra: Sequence[ExtractedURL] = (),
+) -> DetectionSignal:
+    """Flag URLs carrying a base64-encoded recipient address.
+
+    Each candidate URL is inspected independently over its query and fragment.
+    A URL that cannot be parsed never becomes a candidate, so a malformed href
+    costs that href and nothing else.
+
+    Offline and total: `decode_base64_email` returns None rather than raising
+    for every malformed input, so no parameter value can fail the analysis.
+
+    Evidence quotes `candidate.raw`, the URL as the message contained it. The
+    metadata carries the location, the parameter name and the decoded address -
+    the finding is unreadable without them - and deliberately nothing else
+    about the URL: the other parameters are not this signal's business and may
+    hold session tokens.
+
+    There is no abstention path. Every input this signal needs is already in
+    the parsed message, so a URL either carries a decodable address or it does
+    not, and "no encoded address" is a genuine negative rather than an absence
+    of information. That is the whole difference between an offline signal and
+    `l2.redirect_depth`.
+    """
+    candidates = candidate_urls(email, extra=extra)
+
+    metadata: dict[str, object] = {
+        "urls_in_message": len(email.urls),
+        "urls_checked": len(candidates),
+        "matches": [],
+    }
+
+    if not candidates:
+        return _base64_signal(
+            0.0,
+            RiskLevel.LOW,
+            "The message contains no analysable URLs, so none could carry an "
+            "encoded address.",
+            metadata=metadata,
+        )
+
+    matches: list[dict[str, object]] = []
+    for candidate in candidates:
+        for hit in _encoded_addresses(candidate):
+            matches.append(
+                {
+                    "url": candidate.raw,
+                    "location": hit.location,
+                    "parameter": hit.parameter,
+                    "encoded": hit.encoded,
+                    "email": hit.email,
+                }
+            )
+
+    metadata["matches"] = matches
+
+    if not matches:
+        return _base64_signal(
+            0.0,
+            RiskLevel.LOW,
+            f"None of the {len(candidates)} URL(s) in this message carry a "
+            f"base64-encoded email address in their query or fragment.",
+            metadata=metadata,
+        )
+
+    described = "; ".join(
+        f"{match['url']} carries {match['email']} base64-encoded in "
+        + (
+            f"the {match['location']} parameter {match['parameter']!r}"
+            if match["parameter"] is not None
+            else f"the {match['location']}"
+        )
+        for match in matches[:3]
+    )
+    more = f", and {len(matches) - 3} more" if len(matches) > 3 else ""
+    return _base64_signal(
+        BASE64_EMAIL_PARAM_SCORE,
+        _severity(BASE64_EMAIL_PARAM_SCORE),
+        f"{len(matches)} link parameter(s) in this message encode a recipient "
+        f"address, so the link identifies who it was sent to: {described}{more}.",
+        metadata=metadata,
+    )
+
+
+def _base64_signal(
+    score: float,
+    severity: RiskLevel,
+    evidence: str,
+    *,
+    metadata: dict[str, object],
+    error: str | None = None,
+) -> DetectionSignal:
+    return DetectionSignal(
+        layer=DetectionLayer.L2,
+        name="base64_email_param",
+        score=score,
+        severity=severity,
+        evidence=evidence,
+        metadata={**metadata, "fired": score > 0.0 and error is None},
+        error=error,
     )
