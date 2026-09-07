@@ -53,7 +53,8 @@ definition, and a parser that improvises on it produces confident nonsense.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Sequence
+from enum import Enum
+from typing import Protocol, Sequence, runtime_checkable
 from urllib.parse import parse_qsl, urlsplit
 
 from core.models import ExtractedURL, ParsedEmail, URLSource
@@ -61,6 +62,12 @@ from layers.l1_headers import registrable_domain
 
 __all__ = [
     "DEFAULT_PORTS",
+    "REDIRECT_FLAG_DEPTH",
+    "REDIRECT_HOP_CAP",
+    "RedirectFollower",
+    "RedirectHop",
+    "RedirectOutcome",
+    "RedirectTrace",
     "URLCandidate",
     "candidate_urls",
     "canonical_form",
@@ -282,3 +289,229 @@ def candidate_urls(
         candidates.append(candidate)
 
     return candidates
+
+
+# --------------------------------------------------------------------------
+# The redirect result contract
+# --------------------------------------------------------------------------
+#
+# ARCHITECTURE.md section 4 for `l2.redirect_depth`: "Follow hops,
+# allow_redirects=False, cap 8. Flag > 2", with a per-hop timeout of 5s and a
+# 15s total budget.
+#
+# **This is the record only. Nothing here follows a redirect.** Hop-following
+# is network work that section 4 requires to run from sandboxed egress, and it
+# is deliberately not in this module - see the `RedirectFollower` note below.
+# What is here is the shape of the answer, so the follower, the signal and the
+# tests can all be written against one contract.
+#
+# Why a separate record rather than filling in `ExtractedURL.redirect_chain`
+# and `final_url`. Those fields exist and ingest leaves them empty, but writing
+# to them would mean a mutable analysis result living inside the parsed
+# message, shared by reference with every other layer, with no way to say "the
+# chain is empty because nothing was followed" as distinct from "the chain is
+# empty because the URL did not redirect". `URLCandidate` is frozen for the
+# same reason. So a trace is its own immutable record, and the caller holds
+# `ExtractedURL` and `RedirectTrace` side by side rather than one inside the
+# other.
+
+# Section 4: "cap 8" - a hard stop, not a budget to negotiate.
+REDIRECT_HOP_CAP = 8
+
+# Section 4: "Flag > 2". The threshold belongs to the signal, not to the
+# follower; it lives here because the record is what the signal reads, and a
+# constant named once cannot drift between the two.
+REDIRECT_FLAG_DEPTH = 2
+
+
+class RedirectOutcome(str, Enum):
+    """How a redirect trace ended. The distinction scoring depends on.
+
+    `SETTLED` and `CAPPED` are answers about the URL. `UNREACHABLE`,
+    `TIMED_OUT` and `NOT_ATTEMPTED` are absences of information, and the signal
+    that reads them must abstain rather than report a depth of 0 - the same
+    rule Layers 1, 3 and 4 already follow. `is_answer` is the one predicate a
+    caller needs, so no caller has to enumerate this set correctly.
+    """
+
+    # The chain ended at a non-redirect response. The depth is the real depth.
+    SETTLED = "settled"
+
+    # The hop cap was reached with the chain still redirecting. The depth is a
+    # floor, not a measurement - `depth_is_exact` says so - but a chain that is
+    # still redirecting after 8 hops is itself a finding, so this is an answer.
+    CAPPED = "capped"
+
+    # A hop could not be completed: refused, DNS failure, TLS failure, a
+    # malformed Location, a response the follower could not read.
+    UNREACHABLE = "unreachable"
+
+    # The per-hop timeout or the total budget expired.
+    TIMED_OUT = "timed_out"
+
+    # No follower was configured, or egress was unavailable. Nothing was tried.
+    NOT_ATTEMPTED = "not_attempted"
+
+    @property
+    def is_answer(self) -> bool:
+        """True when the trace says something about the URL."""
+        return self in (RedirectOutcome.SETTLED, RedirectOutcome.CAPPED)
+
+
+@dataclass(frozen=True)
+class RedirectHop:
+    """One hop in a chain: a request that answered with a redirect.
+
+    `url` is the URL that was requested, `location` the raw `Location` header
+    it answered with, and `target` that header resolved against `url` - kept
+    separately because a relative `Location` is normal and the raw header is
+    what evidence should quote. `target` is None when the header was absent or
+    could not be resolved, which is how a malformed redirect is recorded
+    rather than guessed at.
+    """
+
+    url: str
+    status_code: int
+    location: str | None = None
+    target: str | None = None
+    elapsed_ms: int = 0
+
+
+@dataclass(frozen=True)
+class RedirectTrace:
+    """The result of following one URL's redirects. Immutable.
+
+    Neither `ExtractedURL` nor `URLCandidate` is modified to produce this: a
+    trace is an observation *about* a URL and is held beside it.
+
+    `url` is the URL the chain started from, exactly as the message contained
+    it. `hops` is the redirect responses in order - so `depth` is `len(hops)`,
+    and a URL that did not redirect has an empty tuple and a depth of 0, which
+    is a genuine measurement rather than a missing one. `final_url` is where
+    the chain came to rest, and is None whenever there is no such place -
+    including every non-answer outcome, so a caller cannot read a final URL out
+    of a trace that never reached one.
+
+    `error` carries why an unsuccessful trace failed, in the same role it has
+    on `DetectionSignal`: it is set when and only when the outcome is not an
+    answer, so "this chain has depth 0" and "this chain was never followed"
+    cannot be confused.
+    """
+
+    url: str
+    outcome: RedirectOutcome
+    hops: tuple[RedirectHop, ...] = ()
+    final_url: str | None = None
+    error: str | None = None
+    elapsed_ms: int = 0
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.outcome, RedirectOutcome):
+            raise TypeError(
+                f"outcome must be a RedirectOutcome, got {type(self.outcome).__name__}"
+            )
+        if not self.url or not self.url.strip():
+            raise ValueError("url must not be empty")
+        if len(self.hops) > REDIRECT_HOP_CAP:
+            raise ValueError(
+                f"a trace may not exceed the {REDIRECT_HOP_CAP}-hop cap, got {len(self.hops)}"
+            )
+        if self.outcome is RedirectOutcome.CAPPED and len(self.hops) != REDIRECT_HOP_CAP:
+            raise ValueError(
+                f"a capped trace has exactly {REDIRECT_HOP_CAP} hops, got {len(self.hops)}"
+            )
+        if self.outcome.is_answer:
+            if self.error is not None:
+                raise ValueError("an answered trace must not carry an error")
+        else:
+            # The invariant that keeps an outage from reading as a depth of 0.
+            if not self.error:
+                raise ValueError(f"a {self.outcome.value} trace must state why")
+            if self.final_url is not None:
+                raise ValueError(f"a {self.outcome.value} trace has no final URL")
+        if self.outcome is RedirectOutcome.SETTLED and self.final_url is None:
+            raise ValueError("a settled trace must record where it came to rest")
+        if self.elapsed_ms < 0:
+            raise ValueError(f"elapsed_ms must not be negative, got {self.elapsed_ms}")
+
+    @property
+    def depth(self) -> int:
+        """Number of redirects followed. 0 for a URL that did not redirect."""
+        return len(self.hops)
+
+    @property
+    def depth_is_exact(self) -> bool:
+        """False when the cap stopped the walk, so `depth` is a lower bound."""
+        return self.outcome is not RedirectOutcome.CAPPED
+
+    @property
+    def is_answer(self) -> bool:
+        """True when this trace says something about the URL."""
+        return self.outcome.is_answer
+
+    @property
+    def chain(self) -> tuple[str, ...]:
+        """Every URL visited, start included, in order.
+
+        The shape `ExtractedURL.redirect_chain` is written in, so a caller that
+        wants to record the walk on the parsed message can, without this record
+        having to reach into it.
+        """
+        visited = [self.url, *(hop.target for hop in self.hops if hop.target)]
+        if self.final_url is not None and (not visited or visited[-1] != self.final_url):
+            visited.append(self.final_url)
+        return tuple(visited)
+
+    @classmethod
+    def not_attempted(cls, url: str, reason: str) -> RedirectTrace:
+        """A trace for a URL nothing tried to follow.
+
+        The state the pipeline is in today: there is no follower and no
+        sandboxed egress, so this is what `l2.redirect_depth` will read and
+        abstain on, rather than reporting every URL as direct.
+        """
+        return cls(url=url, outcome=RedirectOutcome.NOT_ATTEMPTED, error=reason)
+
+
+# --------------------------------------------------------------------------
+# The egress seam
+# --------------------------------------------------------------------------
+#
+# `RedirectFollower` is the injection point ARCHITECTURE.md section 4's safety
+# rules need, and it is the whole of what Layer 2 will know about the network.
+# The same shape as `WhoisLookup`, `AITextDetector`, `ThreatIntelSource` and
+# `ASNLookup`: a Protocol here, an implementation elsewhere, a fake in tests.
+#
+# **No implementation of this Protocol exists in this repository**, and adding
+# one is not this change. Section 4 requires hop-following to run through
+# restricted-network Docker with egress via a VPS or VPN, and states plainly
+# that attacker infrastructure must never be fetched from a home or campus IP.
+# Until that egress exists, `l2.redirect_depth` reads
+# `RedirectTrace.not_attempted` and abstains, which is the honest state - and
+# is why the contract above makes abstention impossible to confuse with a
+# depth of 0.
+#
+# Note the contract is total: an implementation returns a `RedirectTrace` for
+# every URL and does not raise, because a failed walk is a `RedirectTrace` with
+# a non-answer outcome. That differs from the other seams, which signal failure
+# by raising, and it is deliberate - a partial chain is itself evidence, and an
+# exception would throw away the hops that were completed before the failure.
+
+
+@runtime_checkable
+class RedirectFollower(Protocol):
+    """The one network-touching seam in Layer 2's redirect analysis.
+
+    An implementation must honour the section 4 safety rules, none of which
+    this module can enforce for it: `allow_redirects=False` so every hop is
+    observed rather than collapsed by the client, a hard stop at
+    `REDIRECT_HOP_CAP`, a 5s per-hop timeout inside a 15s total budget, no
+    downloads executed, and egress through the sandboxed path.
+
+    It returns a `RedirectTrace` in every case, including failure. It must not
+    raise: a refused connection, a timeout or a malformed `Location` is a trace
+    whose outcome is not an answer, carrying whatever hops were completed
+    first.
+    """
+
+    def follow(self, url: str) -> RedirectTrace: ...
