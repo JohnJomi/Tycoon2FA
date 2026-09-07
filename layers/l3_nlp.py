@@ -4,12 +4,12 @@ Signals specified in ARCHITECTURE.md section 4:
   l3.zero_width    regex over zero-width and BOM codepoints   [implemented]
   l3.urgency       TF-IDF (word 1-2gram + char 3-5gram) -> LR   [implemented]
   l3.perplexity    GPT-2 (124M) mean per-token NLL              [implemented]
-  l3.burstiness    std-dev of per-sentence PPL and of sentence length
+  l3.burstiness    std-dev of per-sentence PPL / length         [implemented]
   l3.fusion        LogisticRegression over the four features above
 
-`zero_width`, `urgency` and `perplexity` are implemented. Burstiness and
-fusion stay unimplemented here rather than being stubbed, so that a message
-analysed today carries two honest absences instead of two fabricated 0.0s.
+`zero_width`, `urgency`, `perplexity` and `burstiness` are implemented. Fusion
+stays unimplemented here rather than being stubbed, so that a message analysed
+today carries one honest absence instead of one fabricated 0.0.
 
 `zero_width` is the deterministic one: a compiled character class over the
 subject and text body, no model, no corpus, no dependency on anything loaded
@@ -28,7 +28,8 @@ body. It is a **measurement, not a verdict**: ARCHITECTURE.md defines no
 mapping from nats-per-token to a 0-1 risk score, and inventing one here would
 be a number nothing calibrated. The figure is carried in the metadata for
 `l3.fusion` to consume, and the signal's own `score` stays 0.0 - see
-`analyze_perplexity`.
+`analyze_perplexity`. `burstiness` is the dispersion of that same measurement
+across sentences, and is reported the same way, for the same reason.
 
 A missing, unreadable or unusable artifact **fails closed**: the signal
 abstains with an `error`, exactly as Layer 1 abstains on an unreachable WHOIS
@@ -45,6 +46,7 @@ from __future__ import annotations
 
 import math
 import re
+import statistics
 import threading
 import unicodedata
 from pathlib import Path
@@ -54,6 +56,8 @@ from typing import Protocol, Sequence, runtime_checkable
 from core.models import DetectionLayer, DetectionSignal, ParsedEmail, RiskLevel
 
 __all__ = [
+    "BURSTINESS_MIN_SENTENCES",
+    "BURSTINESS_MIN_SENTENCE_TOKENS",
     "PERPLEXITY_MAX_TOKENS",
     "PERPLEXITY_MIN_TOKENS",
     "PERPLEXITY_MODEL_NAME",
@@ -64,13 +68,17 @@ __all__ = [
     "ZERO_WIDTH_CHARS",
     "ZERO_WIDTH_RE",
     "ZERO_WIDTH_SCORE",
+    "BurstinessResult",
     "CausalLanguageModel",
     "PerplexityResult",
     "PerplexityUnavailable",
     "UrgencyModel",
     "UrgencyUnavailable",
+    "analyze_burstiness",
     "analyze_perplexity",
+    "compute_burstiness",
     "compute_perplexity",
+    "split_sentences",
     "analyze_urgency",
     "analyze_zero_width",
     "default_perplexity_model",
@@ -551,14 +559,24 @@ def reset_default_perplexity_model() -> None:
         _perplexity_cache = None
 
 
-def compute_perplexity(model: CausalLanguageModel, text: str) -> PerplexityResult:
+def compute_perplexity(
+    model: CausalLanguageModel,
+    text: str,
+    *,
+    min_tokens: int = PERPLEXITY_MIN_TOKENS,
+) -> PerplexityResult:
     """Mean per-token negative log-likelihood over `text`, and its exponential.
 
     Truncates to `PERPLEXITY_MAX_TOKENS` before scoring and raises
-    `PerplexityUnavailable` below `PERPLEXITY_MIN_TOKENS`, per
-    ARCHITECTURE.md section 4. Raises rather than returning a sentinel so the
-    caller has one thing to catch and cannot accidentally average a placeholder
-    into the fusion features later.
+    `PerplexityUnavailable` below `min_tokens`, per ARCHITECTURE.md section 4.
+    Raises rather than returning a sentinel so the caller has one thing to
+    catch and cannot accidentally average a placeholder into the fusion
+    features later.
+
+    `min_tokens` defaults to the section 4 body floor and is lowered only by
+    `analyze_burstiness`, which measures individual sentences - a sentence is
+    an order of magnitude shorter than a body, and holding it to the body's
+    floor would discard every sentence in every message.
     """
     try:
         token_ids = list(model.encode(text))
@@ -566,7 +584,7 @@ def compute_perplexity(model: CausalLanguageModel, text: str) -> PerplexityResul
         raise PerplexityUnavailable(f"tokenization failed: {exc}") from exc
 
     total = len(token_ids)
-    if total < PERPLEXITY_MIN_TOKENS:
+    if total < min_tokens:
         raise PerplexityUnavailable("body too short")
 
     truncated = total > PERPLEXITY_MAX_TOKENS
@@ -693,5 +711,205 @@ def analyze_perplexity(
         f"GPT-2 mean per-token negative log-likelihood is {result.mean_nll:.3f} "
         f"nats{window}, a perplexity of {result.perplexity:.1f}. This is a "
         f"measurement of the text, not a risk score on its own.",
+        metadata=metadata,
+    )
+
+
+# --------------------------------------------------------------------------
+# 4. Burstiness
+# --------------------------------------------------------------------------
+#
+# ARCHITECTURE.md section 4: "Std-dev of per-sentence PPL, and of sentence
+# length." Two dispersions, kept separate all the way into the metadata,
+# because they measure different things: a model writes sentences of unusually
+# even *difficulty*, and it also writes sentences of unusually even *length*,
+# and a message can show either without the other.
+#
+# The same section notes that computing per-sentence PPL first makes the mean
+# free. That is why this reuses `compute_perplexity` sentence by sentence
+# through the existing `CausalLanguageModel` seam rather than adding a second
+# model path: there is exactly one place in this file that knows what a
+# language model is, and it stays that way.
+
+
+# Three sentences is the floor at which a standard deviation says anything at
+# all. Two sentences have a dispersion, arithmetically, but it is the gap
+# between two numbers dressed up as a distribution.
+BURSTINESS_MIN_SENTENCES = 3
+
+# Per-sentence floor, far below the body floor in `PERPLEXITY_MIN_TOKENS`. A
+# four-token sentence yields three predictions, which is noise; below this a
+# sentence is skipped rather than measured.
+BURSTINESS_MIN_SENTENCE_TOKENS = 5
+
+# Conservative segmentation: split on whitespace that follows . ! ? or one of
+# those plus a closing quote or bracket, so the closer stays with its sentence.
+# Spelled as an alternation of fixed-width lookbehinds because Python has no
+# variable-width lookbehind. No abbreviation
+# lexicon, no model, no NLTK - ARCHITECTURE.md budgets no sentence-splitting
+# dependency, and an over-split on "Dr. Smith" costs one sentence boundary,
+# not a wrong verdict. Deterministic by construction.
+_SENTENCE_BOUNDARY_RE = re.compile(
+    r'(?:(?<=[.!?])|(?<=[.!?]")|(?<=[.!?]\')|(?<=[.!?]\))|(?<=[.!?]\]))\s+'
+)
+
+
+@dataclass(frozen=True)
+class BurstinessResult:
+    """The two dispersions, and the per-sentence vectors behind them.
+
+    `perplexity_stddev` is the standard deviation of per-sentence perplexity;
+    `length_stddev` that of sentence length in tokens. Sample standard
+    deviation (n-1), not population: the sentences of one message are a sample
+    of how its author writes, not the whole of it.
+    """
+
+    perplexity_stddev: float
+    length_stddev: float
+    mean_perplexity: float
+    mean_length: float
+    sentence_perplexities: tuple[float, ...]
+    sentence_lengths: tuple[int, ...]
+
+    @property
+    def sentence_count(self) -> int:
+        return len(self.sentence_perplexities)
+
+
+def split_sentences(text: str) -> list[str]:
+    """Split `text` into sentences. Conservative, dependency-free, deterministic."""
+    candidates = _SENTENCE_BOUNDARY_RE.split(text.strip())
+    return [sentence.strip() for sentence in candidates if sentence.strip()]
+
+
+def compute_burstiness(model: CausalLanguageModel, text: str) -> BurstinessResult:
+    """Per-sentence perplexity and length, and the standard deviation of each.
+
+    Sentences under `BURSTINESS_MIN_SENTENCE_TOKENS` are skipped, not scored:
+    a three-token fragment's perplexity is noise and would inflate the
+    dispersion with an artefact of the segmentation. Raises
+    `PerplexityUnavailable` if fewer than `BURSTINESS_MIN_SENTENCES` survive,
+    or if the model fails - never returns a partial or placeholder dispersion.
+    """
+    sentences = split_sentences(text)
+    if len(sentences) < BURSTINESS_MIN_SENTENCES:
+        raise PerplexityUnavailable(
+            f"body has {len(sentences)} sentences, fewer than the "
+            f"{BURSTINESS_MIN_SENTENCES} needed for a dispersion"
+        )
+
+    perplexities: list[float] = []
+    lengths: list[int] = []
+    for sentence in sentences:
+        try:
+            result = compute_perplexity(
+                model, sentence, min_tokens=BURSTINESS_MIN_SENTENCE_TOKENS
+            )
+        except PerplexityUnavailable as exc:
+            if str(exc) == "body too short":
+                continue  # a fragment, not a measurable sentence
+            raise
+        perplexities.append(result.perplexity)
+        lengths.append(result.token_count)
+
+    if len(perplexities) < BURSTINESS_MIN_SENTENCES:
+        raise PerplexityUnavailable(
+            f"only {len(perplexities)} of {len(sentences)} sentences were long "
+            f"enough to measure, fewer than the {BURSTINESS_MIN_SENTENCES} needed"
+        )
+
+    return BurstinessResult(
+        perplexity_stddev=statistics.stdev(perplexities),
+        length_stddev=statistics.stdev(lengths),
+        mean_perplexity=statistics.fmean(perplexities),
+        mean_length=statistics.fmean(lengths),
+        sentence_perplexities=tuple(perplexities),
+        sentence_lengths=tuple(lengths),
+    )
+
+
+def _burstiness_signal(
+    evidence: str,
+    *,
+    metadata: dict[str, object],
+    error: str | None = None,
+) -> DetectionSignal:
+    """Always score 0.0 - see `analyze_burstiness`, as with `analyze_perplexity`."""
+    return DetectionSignal(
+        layer=DetectionLayer.L3,
+        name="burstiness",
+        score=0.0,
+        severity=RiskLevel.LOW,
+        evidence=evidence,
+        metadata={**metadata, "fired": False},
+        error=error,
+    )
+
+
+def analyze_burstiness(
+    source: ParsedEmail,
+    *,
+    model: CausalLanguageModel | None = None,
+    model_name: str | None = None,
+) -> DetectionSignal:
+    """Measure how much the body's sentences vary, in perplexity and in length.
+
+    **A measurement, not a risk**, on exactly the same terms as
+    `analyze_perplexity`: ARCHITECTURE.md defines the two standard deviations
+    and defines no mapping from either to the 0-1 scale, so `score` stays 0.0
+    and both figures are carried separately in the metadata for `l3.fusion` to
+    weigh. They are kept apart rather than combined into one "burstiness
+    number" because the section 4 table names two measurements, and collapsing
+    them would throw away the distinction before anything had learned it was
+    safe to.
+
+    Abstains - `error` set, both dispersions `None` - when the body has too few
+    measurable sentences, or when the language model is unavailable or fails.
+    Never fabricates a dispersion. Never raises, and never opens a socket.
+    """
+    text = (source.body_text or "").strip()
+    metadata: dict[str, object] = {
+        "perplexity_stddev": None,
+        "length_stddev": None,
+        "mean_perplexity": None,
+        "mean_length": None,
+        "sentence_count": None,
+        "sentence_lengths": None,
+        "model": model_name or PERPLEXITY_MODEL_NAME,
+    }
+
+    try:
+        language_model = model if model is not None else default_perplexity_model(model_name)
+        result = compute_burstiness(language_model, text)
+    except PerplexityUnavailable as exc:
+        reason = str(exc)
+        if "sentence" in reason:
+            evidence = (
+                f"The body does not have {BURSTINESS_MIN_SENTENCES} measurable "
+                f"sentences, so its variation could not be measured ({reason}). "
+                f"This is an abstention, not a clean result."
+            )
+        else:
+            evidence = (
+                "The GPT-2 model behind the burstiness measurement was "
+                "unavailable, so this message's sentence variation was not "
+                "measured. This is an absence of information, not a clean result."
+            )
+        return _burstiness_signal(evidence, metadata=metadata, error=reason)
+
+    metadata.update(
+        perplexity_stddev=result.perplexity_stddev,
+        length_stddev=result.length_stddev,
+        mean_perplexity=result.mean_perplexity,
+        mean_length=result.mean_length,
+        sentence_count=result.sentence_count,
+        sentence_lengths=list(result.sentence_lengths),
+    )
+    return _burstiness_signal(
+        f"Across {result.sentence_count} sentences, per-sentence perplexity has "
+        f"a standard deviation of {result.perplexity_stddev:.2f} about a mean of "
+        f"{result.mean_perplexity:.1f}, and sentence length one of "
+        f"{result.length_stddev:.2f} tokens about a mean of {result.mean_length:.1f}. "
+        f"These are measurements of the text, not a risk score on their own.",
         metadata=metadata,
     )
