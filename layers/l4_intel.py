@@ -50,6 +50,7 @@ stands on its own, whatever the others managed.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 from collections.abc import Sequence
@@ -71,6 +72,7 @@ from layers.threat_intel import (
 
 __all__ = [
     "BULLETPROOF_LIST_PATH",
+    "Layer4Uninformative",
     "DOMAIN_IOC_SCORE",
     "HOSTING_FLAG_SCORE",
     "HostingDataUnavailable",
@@ -79,6 +81,8 @@ __all__ = [
     "MAX_DOMAINS_PER_MESSAGE",
     "MAX_URLS_PER_MESSAGE",
     "URL_IOC_SCORE",
+    "analyze",
+    "analyze_async",
     "analyze_domain_ioc",
     "analyze_hosting_flag",
     "analyze_url_ioc",
@@ -871,3 +875,179 @@ def _hosting_signal(
         metadata={**metadata, "fired": score > 0.0 and error is None},
         error=error,
     )
+
+
+# --------------------------------------------------------------------------
+# The layer
+# --------------------------------------------------------------------------
+
+_UNSET = object()
+
+
+class Layer4Uninformative(RuntimeError):
+    """Layer 4 ran but learned nothing about the message.
+
+    Raised by `analyze_async` - never by `analyze`, and never by a signal - to
+    tell the orchestrator `completed=False`, which is the vocabulary
+    ARCHITECTURE.md section 2 already has for "no information". The same
+    device, and the same reasoning, as `l3_nlp.Layer3Uninformative`.
+
+    Layer 4 needs it more than Layer 3 did, because every one of its three
+    signals depends on something external: two on feeds that need API keys, one
+    on an ASN resolver and a curated dataset that this repository deliberately
+    does not ship. With none of them configured, all three abstain - correctly
+    - and a completed layer with three abstentions would still be scored a
+    confident 0.0 by `scoring.composite.layer_score` at Layer 4's full 0.20
+    weight, diluting whatever the other layers actually found.
+
+    The rule: **a signal is a conclusion when it examined something and
+    reached an answer.** A `url_ioc` that consulted a live feed about a real
+    URL and found nothing has checked something, and that genuine negative
+    completes the layer - as does any finding.
+
+    The one case that is *not* a conclusion is a signal that answered without
+    examining anything. Every Layer 4 signal is about URLs and the hosts behind
+    them, so a message with no URLs gives this layer no surface at all. Its
+    signals correctly report genuine negatives - "there was nothing to check" -
+    and those negatives are true, but they are statements about the *absence of
+    URLs*, not about the message. Scoring them as a confident 0.0 at Layer 4's
+    0.20 weight would cut a lone DMARC failure from 0.85 to 0.51, HIGH to
+    MEDIUM, on the strength of a mail having no links in it. That is the same
+    dilution `Layer3Uninformative` exists to prevent.
+
+    No signal's score, metadata, evidence or error changes either way; this is
+    a distinction the adapter draws over signals it does not touch.
+    """
+
+
+# What each signal must have looked at for its answer to count as a conclusion.
+# Read from the metadata the signals already publish; nothing is recomputed and
+# nothing is modified.
+_EXAMINED_KEYS = {
+    "url_ioc": "urls_checked",
+    "domain_ioc": "domains_checked",
+    "hosting_flag": "hosts_checked",
+}
+
+
+def _examined_something(signal: DetectionSignal) -> bool:
+    """Whether a signal actually had an indicator to check.
+
+    `urls_checked` is a count and the other two are lists, so both shapes are
+    read - the signals publish what they publish, and this reads it rather than
+    asking them to agree on a representation.
+    """
+    key = _EXAMINED_KEYS.get(signal.name)
+    if key is None:
+        return False
+    value = signal.metadata.get(key)
+    if isinstance(value, int) and not isinstance(value, bool):
+        return value > 0
+    return bool(value)
+
+
+def _is_informative(signals: Sequence[DetectionSignal]) -> bool:
+    """True when at least one signal reached a conclusion worth scoring."""
+    return any(
+        signal.error is None and (signal.score > 0.0 or _examined_something(signal))
+        for signal in signals
+    )
+
+
+def analyze(
+    email: ParsedEmail,
+    *,
+    sources: Sequence[ThreatIntelSource] | None = None,
+    cache: object | None = _UNSET,
+    asn_lookup: ASNLookup | None = None,
+    hosting_list: HostingList | None = None,
+    hosting_list_path: str | Path | None = None,
+) -> list[DetectionSignal]:
+    """Run every Layer 4 signal over one message.
+
+    Three signals, always, in the order of the ARCHITECTURE.md section 4 table:
+    `url_ioc`, `domain_ioc`, `hosting_flag`.
+
+    Graceful degradation is per signal, not per layer, exactly as in Layers 1
+    and 3. An unreachable feed abstains on the IOC signals; a missing ASN
+    resolver or hosting list abstains on `hosting_flag` alone. With nothing
+    configured at all - the state this repository ships in, since neither the
+    ASN dataset nor the bulletproof list is invented here - all three abstain
+    and none of them crashes or claims the message is clean.
+
+    Every seam is injected. Omitting `sources` uses `default_sources()`;
+    omitting `cache` uses the process-wide store the rest of the project
+    shares, while passing `cache=None` explicitly disables caching. Nothing
+    vendor-specific is constructed by the caller, and the orchestrator
+    constructs nothing at all.
+    """
+    if cache is _UNSET:
+        from layers.l1_headers import default_cache
+
+        store = default_cache()
+    else:
+        store = cache
+
+    return [
+        analyze_url_ioc(email, sources=sources, cache=store),
+        analyze_domain_ioc(email, sources=sources, cache=store),
+        analyze_hosting_flag(
+            email,
+            asn_lookup=asn_lookup,
+            hosting_list=hosting_list,
+            hosting_list_path=hosting_list_path,
+        ),
+    ]
+
+
+# Layer 4's work is network I/O against feed publishers, and the providers are
+# synchronous by design - `httpx.Client`, not `AsyncClient`, so the unit suite
+# can drive them with `MockTransport` and so the cache stays a plain sqlite3
+# wrapper. Running them inline would block the event loop and stall the three
+# layers beside this one, so the whole layer goes to a worker thread. That is
+# the same arrangement `l3_nlp.analyze_async` uses, applied to blocking I/O
+# rather than to blocking compute.
+
+
+async def analyze_async(
+    email: ParsedEmail,
+    *,
+    sources: Sequence[ThreatIntelSource] | None = None,
+    cache: object | None = _UNSET,
+    asn_lookup: ASNLookup | None = None,
+    hosting_list: HostingList | None = None,
+    hosting_list_path: str | Path | None = None,
+) -> list[DetectionSignal]:
+    """`analyze` for an event loop. This is the orchestrator's `LayerCallable`.
+
+    Same three signals, same order, same contents. The orchestrator bounds this
+    with `DEFAULT_LAYER_TIMEOUTS[L4]`, which is 6s; every provider sets its own
+    shorter budget so a slow feed makes that source unavailable before the
+    layer timeout becomes the operative limit - the arrangement Layer 1 uses
+    for WHOIS.
+
+    Raises `Layer4Uninformative` when no signal reached a conclusion. `analyze`
+    itself always returns all three signals; only this adapter, which speaks
+    the orchestrator's completed/incomplete vocabulary, makes that distinction.
+    """
+    signals = await asyncio.to_thread(
+        analyze,
+        email,
+        sources=sources,
+        cache=cache,
+        asn_lookup=asn_lookup,
+        hosting_list=hosting_list,
+        hosting_list_path=hosting_list_path,
+    )
+
+    if not _is_informative(signals):
+        reasons = "; ".join(
+            f"{signal.name}: {signal.error}" for signal in signals if signal.error
+        )
+        raise Layer4Uninformative(
+            f"no Layer 4 signal reached a conclusion ({reasons})"
+            if reasons
+            else "no Layer 4 signal reached a conclusion"
+        )
+
+    return signals
