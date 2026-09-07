@@ -44,6 +44,7 @@ or reaches for one.
 
 from __future__ import annotations
 
+import asyncio
 import math
 import re
 import statistics
@@ -78,6 +79,9 @@ __all__ = [
     "PerplexityUnavailable",
     "UrgencyModel",
     "UrgencyUnavailable",
+    "Layer3Uninformative",
+    "analyze",
+    "analyze_async",
     "analyze_burstiness",
     "analyze_fusion",
     "analyze_perplexity",
@@ -1205,3 +1209,137 @@ def analyze_fusion(
             "fired": score > 0.0,
         },
     )
+
+
+# --------------------------------------------------------------------------
+# The layer
+# --------------------------------------------------------------------------
+
+
+def analyze(
+    email: ParsedEmail,
+    *,
+    urgency_model: UrgencyModel | None = None,
+    language_model: CausalLanguageModel | None = None,
+    fusion_model: FusionModel | None = None,
+) -> list[DetectionSignal]:
+    """Run every Layer 3 signal over one message.
+
+    Five signals, always, in the order of the ARCHITECTURE.md section 4 table:
+    zero-width, urgency, perplexity, burstiness, then fusion over the four.
+
+    Fusion runs last and is handed the four signals just produced, which is the
+    ordering requirement the whole layer has: it consumes their published
+    measurements and recomputes nothing.
+
+    Graceful degradation is per signal, not per layer, exactly as in Layer 1.
+    An unavailable classifier abstains on `urgency`; an unavailable language
+    model abstains on `perplexity` and `burstiness`, and fusion then abstains
+    in turn because two of its four inputs are absences rather than zeros. The
+    layer still completes and `zero_width` still reports, which is what keeps a
+    model outage distinguishable from a clean message.
+
+    The three model seams are injected, not constructed here. Omitting them
+    uses each model's own process-wide singleton; the unit and integration
+    suites pass fakes, so nothing in the pipeline loads a checkpoint to be
+    tested.
+    """
+    zero_width = analyze_zero_width(email)
+    urgency = analyze_urgency(email, model=urgency_model)
+    perplexity = analyze_perplexity(email, model=language_model)
+    burstiness = analyze_burstiness(email, model=language_model)
+
+    components = [zero_width, urgency, perplexity, burstiness]
+    return [*components, analyze_fusion(components, model=fusion_model)]
+
+
+class Layer3Uninformative(RuntimeError):
+    """Layer 3 ran but learned nothing about the message.
+
+    Raised by `analyze_async` - never by `analyze`, and never by a signal - to
+    tell the orchestrator `completed=False`, which is the vocabulary
+    ARCHITECTURE.md section 2 already has for "no information".
+
+    Why the layer needs it. Four of the five signals depend on a model. With no
+    checkpoint on disk they all abstain, correctly, and the only signal left is
+    `zero_width` reporting a genuine "no invisible characters here". That is a
+    true statement about the message's *formatting* and no statement at all
+    about its *text* - but `scoring.composite.layer_score` takes the maximum
+    over non-abstaining signals, so the layer would score a confident 0.0 at
+    its full 0.20 weight. A DMARC failure scoring 0.85 alone would come back as
+    0.51 - MEDIUM instead of HIGH - because Layer 3 found no zero-width spaces.
+    That is precisely the dilution the orchestrator's own comment describes,
+    and section 5's `/health` readiness gate on the GPT-2 load state says the
+    same thing: a Layer 3 without its model is not a ready layer.
+
+    So the layer completes when it has something to say - fusion reached a
+    verdict, or some component signal actually fired - and reports incomplete
+    when every signal either abstained or found nothing from a partial view.
+    No signal's score, metadata or abstention changes either way.
+    """
+
+
+def _is_informative(signals: Sequence[DetectionSignal]) -> bool:
+    """True when at least one signal reached a conclusion worth scoring."""
+    by_name = {signal.name: signal for signal in signals}
+
+    fusion = by_name.get("fusion")
+    if fusion is not None and fusion.error is None:
+        return True  # the layer reached its verdict, whatever that verdict is
+
+    # No fused verdict, but a component that actually found something still
+    # carries real evidence and must reach the caller.
+    return any(
+        signal.error is None and signal.score > 0.0
+        for name, signal in by_name.items()
+        if name != "fusion"
+    )
+
+
+# Layer 3's work is CPU-bound in-process inference, not I/O: a GPT-2 forward
+# pass holds the interpreter rather than waiting on a socket. Running it inline
+# on the event loop would stall the three layers running beside it for the
+# duration of the pass, so the whole layer goes to a worker thread. That is the
+# same reasoning as `l1_headers.analyze_async`, applied to a different kind of
+# blocking - and it is the only difference between the two functions.
+
+
+async def analyze_async(
+    email: ParsedEmail,
+    *,
+    urgency_model: UrgencyModel | None = None,
+    language_model: CausalLanguageModel | None = None,
+    fusion_model: FusionModel | None = None,
+) -> list[DetectionSignal]:
+    """`analyze` for an event loop. This is the orchestrator's `LayerCallable`.
+
+    Same five signals, same order, same contents. The orchestrator bounds this
+    with `DEFAULT_LAYER_TIMEOUTS[L3]`; nothing here sets a budget of its own,
+    because every model call is local and in-process, and a timeout would
+    abandon a thread mid-forward-pass for no benefit.
+
+    Raises `Layer3Uninformative` when the layer learned nothing - see that
+    class for why a layer whose models are all missing must not be scored as a
+    clean 0.0. `analyze` itself always returns all five signals; only this
+    adapter, which speaks the orchestrator's completed/incomplete vocabulary,
+    makes that distinction.
+    """
+    signals = await asyncio.to_thread(
+        analyze,
+        email,
+        urgency_model=urgency_model,
+        language_model=language_model,
+        fusion_model=fusion_model,
+    )
+
+    if not _is_informative(signals):
+        reasons = "; ".join(
+            f"{signal.name}: {signal.error}" for signal in signals if signal.error
+        )
+        raise Layer3Uninformative(
+            f"no Layer 3 signal reached a conclusion ({reasons})"
+            if reasons
+            else "no Layer 3 signal reached a conclusion"
+        )
+
+    return signals

@@ -212,7 +212,7 @@ async def test_default_l1_emits_no_stub_signal(email):
 
 
 @pytest.mark.asyncio
-async def test_default_l2_l3_l4_report_themselves_as_unimplemented(email):
+async def test_the_unwritten_layers_report_themselves_as_unimplemented(email):
     """An unwritten layer must not look like a layer that ran and found nothing.
 
     `completed=True` with no signals is a claim of innocence that scoring counts
@@ -221,10 +221,16 @@ async def test_default_l2_l3_l4_report_themselves_as_unimplemented(email):
     """
     results = _by_layer(await run_layers(email))
 
-    for layer in (DetectionLayer.L2, DetectionLayer.L3, DetectionLayer.L4):
+    for layer in (DetectionLayer.L2, DetectionLayer.L4):
         assert results[layer].completed is False
         assert results[layer].signals == []
         assert "not implemented" in results[layer].error
+
+    # L3 is written. With no model artifacts on this machine its signals all
+    # abstain, so it reports incomplete for its own reason rather than for the
+    # unwritten-layer one - still "no information", never a clean 0.0.
+    assert results[DetectionLayer.L3].completed is False
+    assert "not implemented" not in results[DetectionLayer.L3].error
 
 
 @pytest.mark.asyncio
@@ -467,11 +473,12 @@ async def test_a_none_returning_layer_does_not_stop_the_others(email):
     results = _by_layer(await run_layers(email, layers={DetectionLayer.L2: returns_none}))
 
     assert results[DetectionLayer.L2].completed is False
-    # L1 is real and still ran. L3/L4 are unwritten and report that - a
-    # different reason from L2's, but neither stopped the others.
+    # L1 is real and still ran. L4 is unwritten and reports that; L3 is
+    # written but has no models here - different reasons from L2's, and from
+    # each other's, but none of them stopped the others.
     assert results[DetectionLayer.L1].completed is True
-    for layer in (DetectionLayer.L3, DetectionLayer.L4):
-        assert "not implemented" in results[layer].error
+    assert "not implemented" in results[DetectionLayer.L4].error
+    assert results[DetectionLayer.L3].error is not None
 
 
 @pytest.mark.asyncio
@@ -486,7 +493,7 @@ async def test_partial_custom_layer_mapping_still_runs_all_four_layers(email):
     # The untouched defaults still ran: L1 produced its signals, and the
     # unwritten layers reported themselves rather than being skipped.
     assert [s.name for s in results[0].signals] == L1_SIGNAL_NAMES
-    assert results[2].completed is False and "not implemented" in results[2].error
+    assert results[2].completed is False and results[2].error is not None
     assert results[3].completed is False and "not implemented" in results[3].error
 
 
