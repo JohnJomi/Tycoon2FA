@@ -57,11 +57,20 @@ from enum import Enum
 from typing import Protocol, Sequence, runtime_checkable
 from urllib.parse import parse_qsl, urlsplit
 
-from core.models import ExtractedURL, ParsedEmail, URLSource
+from core.models import (
+    DetectionLayer,
+    DetectionSignal,
+    ExtractedURL,
+    ParsedEmail,
+    RiskLevel,
+    URLSource,
+)
 from layers.l1_headers import registrable_domain
 
 __all__ = [
     "DEFAULT_PORTS",
+    "REDIRECT_CAPPED_SCORE",
+    "REDIRECT_DEPTH_SCORE",
     "REDIRECT_FLAG_DEPTH",
     "REDIRECT_HOP_CAP",
     "RedirectFollower",
@@ -69,6 +78,7 @@ __all__ = [
     "RedirectOutcome",
     "RedirectTrace",
     "URLCandidate",
+    "analyze_redirect_depth",
     "candidate_urls",
     "canonical_form",
     "parse_url",
@@ -515,3 +525,231 @@ class RedirectFollower(Protocol):
     """
 
     def follow(self, url: str) -> RedirectTrace: ...
+
+
+# --------------------------------------------------------------------------
+# l2.redirect_depth
+# --------------------------------------------------------------------------
+#
+# ARCHITECTURE.md section 4: "Follow hops, allow_redirects=False, cap 8.
+# Flag > 2."
+#
+# This function follows nothing. It reads `RedirectTrace`s produced by an
+# injected `RedirectFollower` and turns them into one signal - the same
+# division Layer 1 uses between `analyze_domain_age` and `WhoisLookup`, and
+# Layer 4 between `analyze_url_ioc` and `ThreatIntelSource`. No follower is
+# constructed here, so the signal is fully exercisable with fakes and there is
+# no path by which running the unit suite reaches the network.
+
+# Hand-assigned for Phase A exactly as the Layer 1 and Layer 4 scores are, and
+# refitted in Phase 5 against the labelled corpus.
+#
+# A chain of three or more hops is a moderate indicator: link-shortener stacks
+# and marketing trackers legitimately produce them, so this sits with
+# `l1.replyto_mismatch` (0.55) rather than with a confirmed IOC listing.
+REDIRECT_DEPTH_SCORE = 0.55
+
+# A chain *still redirecting* after eight hops is a stronger statement than a
+# measured three. Nothing legitimate needs nine hops, and the reason the depth
+# is inexact - the walk was stopped, not finished - is itself the finding.
+REDIRECT_CAPPED_SCORE = 0.70
+
+# Verdict bands from config/weights.yaml, applied to this signal's own score so
+# its severity means what the composite's deliver/warn/block bands mean.
+_WARN_THRESHOLD = 0.35
+_BLOCK_THRESHOLD = 0.65
+
+
+def _severity(score: float) -> RiskLevel:
+    if score >= _BLOCK_THRESHOLD:
+        return RiskLevel.HIGH
+    if score >= _WARN_THRESHOLD:
+        return RiskLevel.MEDIUM
+    return RiskLevel.LOW
+
+
+def _redirect_signal(
+    score: float,
+    severity: RiskLevel,
+    evidence: str,
+    *,
+    metadata: dict[str, object],
+    error: str | None = None,
+) -> DetectionSignal:
+    """Build the signal, recording `fired` as every other layer here does."""
+    return DetectionSignal(
+        layer=DetectionLayer.L2,
+        name="redirect_depth",
+        score=score,
+        severity=severity,
+        evidence=evidence,
+        metadata={**metadata, "fired": score > 0.0 and error is None},
+        error=error,
+    )
+
+
+def _describe(trace: RedirectTrace) -> dict[str, object]:
+    """One trace as metadata. `exact` is what keeps a cap from reading as 8."""
+    return {
+        "url": trace.url,
+        "outcome": trace.outcome.value,
+        "depth": trace.depth,
+        "exact": trace.depth_is_exact,
+        "final_url": trace.final_url,
+        "chain": list(trace.chain),
+        "error": trace.error,
+    }
+
+
+def analyze_redirect_depth(
+    email: ParsedEmail,
+    *,
+    follower: RedirectFollower | None = None,
+    extra: Sequence[ExtractedURL] = (),
+) -> DetectionSignal:
+    """Flag messages whose links redirect more than twice before landing.
+
+    Each candidate URL is walked independently, so one unreachable link does
+    not stop the others being analysed and does not suppress a finding on a
+    link that was walked successfully.
+
+    **A capped chain is never reported as a measured depth of 8.** It is an
+    answer - a chain still redirecting at the cap is a finding in its own right
+    - but `depth` is a floor, and every place the number appears carries
+    `exact: false` beside it in the metadata and "at least" in the evidence.
+
+    Abstains, rather than reporting a clean result, when no URL could be walked
+    - no follower configured, every walk unreachable or timed out - and also
+    when nothing was found but some URL went unchecked, because "none of these
+    links redirect" is a claim about links that were actually followed. A
+    partial chain that failed mid-walk is an abstention carrying the hops it
+    managed, never a depth-0 clean result.
+
+    Evidence quotes `candidate.raw`, the URL as the message contained it, not
+    the canonical form used for deduplication - reporting a rewritten URL would
+    be reporting something the message did not say.
+
+    Never raises. Never opens a socket, resolves a name or follows a redirect:
+    all of that is the injected follower's job, behind the seam.
+    """
+    candidates = candidate_urls(email, extra=extra)
+
+    metadata: dict[str, object] = {
+        "urls_in_message": len(email.urls),
+        "urls_checked": 0,
+        "flag_depth": REDIRECT_FLAG_DEPTH,
+        "hop_cap": REDIRECT_HOP_CAP,
+        "traces": [],
+        "findings": [],
+        "abstentions": {},
+        "deepest_exact": None,
+    }
+
+    if not candidates:
+        # Genuine negative: the check ran over the zero URLs this message has.
+        return _redirect_signal(
+            0.0,
+            RiskLevel.LOW,
+            "The message contains no analysable URLs, so there was no redirect "
+            "chain to follow.",
+            metadata=metadata,
+        )
+
+    metadata["urls_checked"] = len(candidates)
+
+    traces: list[RedirectTrace] = []
+    for candidate in candidates:
+        if follower is None:
+            traces.append(
+                RedirectTrace.not_attempted(candidate.raw, "no redirect follower configured")
+            )
+            continue
+        try:
+            trace = follower.follow(candidate.raw)
+        except Exception as exc:  # noqa: BLE001 - the seam forbids this, so a
+            # follower that raises is broken rather than authoritative.
+            trace = RedirectTrace(
+                url=candidate.raw,
+                outcome=RedirectOutcome.UNREACHABLE,
+                error=f"follower raised {type(exc).__name__}: {exc}",
+            )
+        if not isinstance(trace, RedirectTrace):
+            trace = RedirectTrace(
+                url=candidate.raw,
+                outcome=RedirectOutcome.UNREACHABLE,
+                error=f"follower returned {type(trace).__name__}, not a RedirectTrace",
+            )
+        traces.append(trace)
+
+    answered = [trace for trace in traces if trace.is_answer]
+    abstained = {trace.url: (trace.error or "not followed") for trace in traces if not trace.is_answer}
+    findings = [trace for trace in answered if trace.depth > REDIRECT_FLAG_DEPTH]
+
+    exact_depths = [trace.depth for trace in answered if trace.depth_is_exact]
+    metadata.update(
+        traces=[_describe(trace) for trace in traces],
+        findings=[_describe(trace) for trace in findings],
+        abstentions=abstained,
+        deepest_exact=max(exact_depths) if exact_depths else None,
+    )
+
+    if findings:
+        capped = [trace for trace in findings if not trace.depth_is_exact]
+        score = REDIRECT_CAPPED_SCORE if capped else REDIRECT_DEPTH_SCORE
+        described = "; ".join(
+            f"{trace.url} redirects "
+            f"{'at least ' if not trace.depth_is_exact else ''}{trace.depth} times"
+            + ("" if trace.depth_is_exact else f" and was still redirecting at the "
+               f"{REDIRECT_HOP_CAP}-hop cap")
+            for trace in findings[:3]
+        )
+        more = f", and {len(findings) - 3} more" if len(findings) > 3 else ""
+        caveat = (
+            f" {len(abstained)} other URL(s) could not be followed."
+            if abstained
+            else ""
+        )
+        return _redirect_signal(
+            score,
+            _severity(score),
+            f"{len(findings)} of the {len(candidates)} URL(s) in this message "
+            f"redirect more than {REDIRECT_FLAG_DEPTH} times before landing: "
+            f"{described}{more}.{caveat}",
+            metadata=metadata,
+        )
+
+    if not answered:
+        reasons = "; ".join(f"{url}: {reason}" for url, reason in abstained.items())
+        return _redirect_signal(
+            0.0,
+            RiskLevel.LOW,
+            f"None of the {len(candidates)} URL(s) in this message could be "
+            f"followed ({reasons}), so their redirect chains were not measured. "
+            f"This is an absence of information, not a clean result.",
+            metadata=metadata,
+            error=f"no URL could be followed ({reasons})",
+        )
+
+    if abstained:
+        # Some links were walked and were shallow, but others were not walked
+        # at all. "No link redirects more than twice" would be a claim about
+        # URLs nobody followed.
+        reasons = "; ".join(f"{url}: {reason}" for url, reason in abstained.items())
+        return _redirect_signal(
+            0.0,
+            RiskLevel.LOW,
+            f"{len(abstained)} of the {len(candidates)} URL(s) in this message "
+            f"could not be followed ({reasons}), so the message was not fully "
+            f"checked. This is an absence of information, not a clean result.",
+            metadata=metadata,
+            error=f"{len(abstained)} of {len(candidates)} URL(s) could not be followed",
+        )
+
+    deepest = max(trace.depth for trace in answered)
+    return _redirect_signal(
+        0.0,
+        RiskLevel.LOW,
+        f"All {len(candidates)} URL(s) in this message settle within "
+        f"{REDIRECT_FLAG_DEPTH} redirect(s); the longest chain is {deepest}.",
+        metadata=metadata,
+    )
