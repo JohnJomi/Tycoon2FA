@@ -73,6 +73,7 @@ from layers.l1_headers import BRAND_DOMAINS, registrable_domain
 
 __all__ = [
     "BASE64_EMAIL_PARAM_SCORE",
+    "QR_URL_SCORE",
     "QRDecodeResult",
     "QRDecoder",
     "QROutcome",
@@ -97,6 +98,8 @@ __all__ = [
     "URLCandidate",
     "analyze_base64_email_param",
     "analyze_domain_mismatch_brand",
+    "analyze_qr_url",
+    "eligible_qr_attachments",
     "brands_named_in",
     "analyze_redirect_depth",
     "decode_base64_email",
@@ -1731,3 +1734,305 @@ class QRDecoder(Protocol):
     """
 
     def decode(self, payload: bytes, attachment: Attachment) -> QRDecodeResult: ...
+
+
+# --------------------------------------------------------------------------
+# l2.qr_url
+# --------------------------------------------------------------------------
+#
+# ARCHITECTURE.md section 4: "`pyzbar` decode of image attachments + inline
+# images; extracted URL re-enters the URL signal set." Section 4 calls this the
+# differentiator - per the research doc it is Tycoon's primary SEG bypass,
+# because a gateway that scans text and hrefs sees nothing at all in a PNG.
+#
+# This function decodes nothing. It walks the eligible attachments, asks an
+# injected `QRDecoder` about each one, and turns what comes back into a signal.
+# No concrete decoder is constructed here and `pyzbar` is not imported - there
+# is no decoder in this repository yet, which is why signal number five
+# abstains rather than reporting every message's images as clean.
+#
+# **The decoded payload is untrusted attacker text and is never dereferenced.**
+# Nothing here fetches it, resolves it, renders it or follows it. It is decoded,
+# recorded verbatim, and handed to `candidate_urls`, which is the one place in
+# this layer that decides what is an analysable URL.
+
+# Hand-assigned for Phase A on the same terms as every other score in this
+# project, and refitted in Phase 5. Section 4 assigns no score to any signal.
+#
+# 0.65 - at the block band, and the highest of the Layer 2 offline signals.
+# **The finding is not "this message contains a QR code."** QR codes are
+# ordinary in legitimate mail: event tickets, menus, two-factor enrolment,
+# payment slips. The finding is that a *URL was concealed inside an image*,
+# where every text-based control in the delivery path is blind to it, and that
+# the concealed URL is then available for the rest of Layer 2 and Layer 4 to
+# judge on its own merits. That concealment is the phishing-relevant fact, and
+# it is why this sits above `l2.domain_mismatch_brand` but is not conclusive on
+# its own: a legitimate QR code also conceals a URL, it just does not lead
+# anywhere interesting.
+QR_URL_SCORE = 0.65
+
+
+def eligible_qr_attachments(email: ParsedEmail) -> list[Attachment]:
+    """The attachments worth handing to a decoder, in message order.
+
+    Section 4's "image attachments + inline images": both, from the single
+    attachment list, filtered on `QR_IMAGE_CONTENT_TYPES`. Inline images need
+    no separate path - they are already in `attachments` carrying a
+    `content_id`, which is what `ParsedEmail.inline_images` derives from.
+
+    A non-image part is not a decode failure and not an abstention. There was
+    nothing to decode, so it is simply not offered.
+    """
+    return [
+        attachment
+        for attachment in email.attachments
+        if (attachment.content_type or "").lower() in QR_IMAGE_CONTENT_TYPES
+    ]
+
+
+def _decode_attachment(
+    email: ParsedEmail,
+    attachment: Attachment,
+    decoder: QRDecoder,
+    max_bytes: int | None,
+) -> QRDecodeResult:
+    """One attachment's decode result. Never raises.
+
+    The bytes come from `ingest.parser.attachment_payload`, which reads them
+    back out of `ParsedEmail.raw` - `Attachment` carries no payload and this
+    signal does not add one. A payload that cannot be produced (no raw bytes,
+    an undecodable part, one above the size limit) is `NOT_ATTEMPTED`: nothing
+    was inspected, so nothing is known.
+
+    A decoder that raises, or returns something that is not a `QRDecodeResult`,
+    is broken rather than authoritative and is recorded as `UNREADABLE`.
+    """
+    from ingest.parser import AttachmentPayloadUnavailable, attachment_payload
+
+    try:
+        payload = (
+            attachment_payload(email, attachment)
+            if max_bytes is None
+            else attachment_payload(email, attachment, max_bytes=max_bytes)
+        )
+    except AttachmentPayloadUnavailable as exc:
+        return QRDecodeResult.not_attempted(attachment, str(exc))
+    except Exception as exc:  # noqa: BLE001 - ingest must not sink the layer
+        return QRDecodeResult.not_attempted(
+            attachment, f"payload could not be read: {type(exc).__name__}: {exc}"
+        )
+
+    try:
+        result = decoder.decode(payload, attachment)
+    except Exception as exc:  # noqa: BLE001 - the seam forbids this
+        return QRDecodeResult(
+            attachment=attachment,
+            outcome=QROutcome.UNREADABLE,
+            error=f"decoder raised {type(exc).__name__}: {exc}",
+        )
+
+    if not isinstance(result, QRDecodeResult):
+        return QRDecodeResult(
+            attachment=attachment,
+            outcome=QROutcome.UNREADABLE,
+            error=f"decoder returned {type(result).__name__}, not a QRDecodeResult",
+        )
+    return result
+
+
+def analyze_qr_url(
+    email: ParsedEmail,
+    *,
+    decoder: QRDecoder | None = None,
+    max_payload_bytes: int | None = None,
+) -> DetectionSignal:
+    """Flag URLs concealed inside the message's images.
+
+    Every eligible image is decoded independently, so one corrupt attachment
+    costs that attachment alone and never suppresses a finding from another.
+
+    Decoded payloads re-enter the URL candidate set exactly as section 4
+    requires: `QRDecodeResult.as_extracted_urls()` produces
+    `ExtractedURL(source=QR_CODE)` values, and `candidate_urls(extra=...)`
+    decides which of them are analysable http(s) URLs. A payload that is not
+    one - `WIFI:`, a vCard, plain text - is recorded as decoded and is **not** a
+    finding. This function performs no URL validation of its own and never
+    dereferences a payload.
+
+    Abstains when eligible images could not be inspected: no decoder injected,
+    payload bytes unavailable, or a decode that failed. A finding from another
+    image survives that, because a URL hidden in one image is a fact whatever
+    happened to the next one - but a message is never reported clean while an
+    eligible image remains uninspected.
+
+    Never raises. Never opens a socket. Never mutates the message, the
+    attachments or the candidates.
+    """
+    eligible = eligible_qr_attachments(email)
+
+    metadata: dict[str, object] = {
+        "attachments_in_message": len(email.attachments),
+        "images_eligible": len(eligible),
+        "images_inspected": 0,
+        "matches": [],
+        "non_url_payloads": [],
+        "failures": [],
+    }
+
+    if not eligible:
+        return _qr_signal(
+            0.0,
+            RiskLevel.LOW,
+            "The message carries no image attachments or inline images, so no "
+            "URL could be concealed in one.",
+            metadata=metadata,
+        )
+
+    if decoder is None:
+        failures = [
+            {**_provenance(attachment), "error": "no QR decoder configured"}
+            for attachment in eligible
+        ]
+        metadata["failures"] = failures
+        return _qr_signal(
+            0.0,
+            RiskLevel.LOW,
+            f"No QR decoder is configured, so the {len(eligible)} image(s) in "
+            f"this message were not inspected. This is an absence of "
+            f"information, not a clean result.",
+            metadata=metadata,
+            error="no QR decoder configured",
+        )
+
+    results = [
+        _decode_attachment(email, attachment, decoder, max_payload_bytes)
+        for attachment in eligible
+    ]
+
+    inspected = [result for result in results if result.is_answer]
+    failures = [
+        {**_provenance(result.attachment), "error": result.error or result.outcome.value}
+        for result in results
+        if not result.is_answer
+    ]
+
+    # Provenance is recorded against the payload exactly as decoded, before
+    # anything decides whether it is a URL.
+    extra: list[ExtractedURL] = []
+    origin: dict[str, QRDecodeResult] = {}
+    non_url: list[dict[str, object]] = []
+    for result in inspected:
+        for extracted in result.as_extracted_urls():
+            extra.append(extracted)
+            origin.setdefault(extracted.url, result)
+
+    candidates = candidate_urls(email, extra=extra)
+    qr_candidates = [c for c in candidates if c.source is URLSource.QR_CODE]
+    analysable = {c.raw for c in qr_candidates}
+
+    for payload_url, result in origin.items():
+        if payload_url.strip() not in analysable and payload_url not in analysable:
+            non_url.append(
+                {
+                    **_provenance(result.attachment),
+                    "payload": payload_url,
+                }
+            )
+
+    matches = [
+        {
+            **_provenance(origin[candidate.raw].attachment),
+            "url": candidate.raw,
+            "host": candidate.host,
+        }
+        for candidate in qr_candidates
+        if candidate.raw in origin
+    ]
+
+    metadata.update(
+        images_inspected=len(inspected),
+        matches=matches,
+        non_url_payloads=non_url,
+        failures=failures,
+    )
+
+    if matches:
+        described = "; ".join(
+            f"{match['url']} concealed in "
+            + (f"inline image {match['filename']!r}" if match["inline"] else f"{match['filename']!r}")
+            for match in matches[:3]
+        )
+        more = f", and {len(matches) - 3} more" if len(matches) > 3 else ""
+        caveat = (
+            f" {len(failures)} other image(s) could not be inspected."
+            if failures
+            else ""
+        )
+        return _qr_signal(
+            QR_URL_SCORE,
+            _severity(QR_URL_SCORE),
+            f"{len(matches)} URL(s) are encoded inside this message's images, "
+            f"where text-based scanning cannot see them: {described}{more}."
+            f"{caveat}",
+            metadata=metadata,
+        )
+
+    if failures:
+        reasons = "; ".join(
+            f"{failure['filename'] or '<unnamed>'}: {failure['error']}" for failure in failures
+        )
+        return _qr_signal(
+            0.0,
+            RiskLevel.LOW,
+            f"{len(failures)} of the {len(eligible)} image(s) in this message "
+            f"could not be inspected ({reasons}), so the message was not fully "
+            f"checked. This is an absence of information, not a clean result.",
+            metadata=metadata,
+            error=f"{len(failures)} of {len(eligible)} image(s) could not be inspected",
+        )
+
+    if non_url:
+        return _qr_signal(
+            0.0,
+            RiskLevel.LOW,
+            f"All {len(eligible)} image(s) in this message were inspected; the "
+            f"{len(non_url)} code(s) found encode no web address.",
+            metadata=metadata,
+        )
+
+    return _qr_signal(
+        0.0,
+        RiskLevel.LOW,
+        f"All {len(eligible)} image(s) in this message were inspected and carry "
+        f"no encoded URL.",
+        metadata=metadata,
+    )
+
+
+def _provenance(attachment: Attachment) -> dict[str, object]:
+    """Which attachment a row describes. Metadata only - never any content."""
+    return {
+        "filename": attachment.filename,
+        "content_type": attachment.content_type,
+        "content_id": attachment.content_id,
+        "inline": attachment.is_inline,
+    }
+
+
+def _qr_signal(
+    score: float,
+    severity: RiskLevel,
+    evidence: str,
+    *,
+    metadata: dict[str, object],
+    error: str | None = None,
+) -> DetectionSignal:
+    return DetectionSignal(
+        layer=DetectionLayer.L2,
+        name="qr_url",
+        score=score,
+        severity=severity,
+        evidence=evidence,
+        metadata={**metadata, "fired": score > 0.0 and error is None},
+        error=error,
+    )
