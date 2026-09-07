@@ -281,8 +281,9 @@ async def test_layer_one_still_completes_while_other_layers_run(email, monkeypat
         DetectionLayer.L3,
         DetectionLayer.L4,
     ]
-    # The other three are unwritten, so they report incomplete - but they do it
-    # immediately rather than spending the WHOIS delay waiting their turn.
+    # The other three report incomplete - L2 and L4 unwritten, L3 with no model
+    # artifacts here - but they do it immediately rather than spending the
+    # WHOIS delay waiting their turn.
     for result in results[1:]:
         assert result.duration_ms < 100
 

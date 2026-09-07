@@ -16,9 +16,9 @@ way to scoring, because collapsing them turns an outage into an all-clear.
 Scope: this module runs layers and reports what happened. It does not score,
 does not decide a verdict, and does not know what any layer looks for.
 
-Layer 1 is real: `DEFAULT_LAYERS` points at `layers.l1_headers.analyze_async`,
-which is the layer's own async adapter. Layers 2-4 are not written yet, and
-say so: they report `completed=False`, which is the same state a timeout
+Layers 1 and 3 are real: `DEFAULT_LAYERS` points at each layer's own async
+adapter, `layers.l1_headers.analyze_async` and `layers.l3_nlp.analyze_async`.
+Layers 2 and 4 are not written yet, and say so: they report `completed=False`, which is the same state a timeout
 produces and means "no information", not "nothing found". Scoring then
 redistributes their weight onto the layers that did run, so an unwritten layer
 cannot dilute a real finding.
@@ -31,7 +31,7 @@ import time
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 
 from core.models import DetectionLayer, DetectionSignal, LayerResult, ParsedEmail
-from layers import l1_headers
+from layers import l1_headers, l3_nlp
 
 __all__ = [
     "DEFAULT_LAYERS",
@@ -189,7 +189,7 @@ async def run_layers(
 # --------------------------------------------------------------------------
 # The layer mapping
 #
-# L1 is the real implementation. L2-L4 are not written yet.
+# L1 and L3 are the real implementations. L2 and L4 are not written yet.
 #
 # An unwritten layer must not return `[]`. A layer that completes with no
 # signals is making a claim - "I ran, and I found nothing" - and scoring counts
@@ -231,6 +231,6 @@ def unimplemented_layer(layer: DetectionLayer, description: str) -> LayerCallabl
 DEFAULT_LAYERS: Mapping[DetectionLayer, LayerCallable] = {
     DetectionLayer.L1: l1_headers.analyze_async,
     DetectionLayer.L2: unimplemented_layer(DetectionLayer.L2, "URL & redirect chain"),
-    DetectionLayer.L3: unimplemented_layer(DetectionLayer.L3, "NLP & obfuscation"),
+    DetectionLayer.L3: l3_nlp.analyze_async,
     DetectionLayer.L4: unimplemented_layer(DetectionLayer.L4, "threat intelligence"),
 }
