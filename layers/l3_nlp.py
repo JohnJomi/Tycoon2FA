@@ -5,11 +5,11 @@ Signals specified in ARCHITECTURE.md section 4:
   l3.urgency       TF-IDF (word 1-2gram + char 3-5gram) -> LR   [implemented]
   l3.perplexity    GPT-2 (124M) mean per-token NLL              [implemented]
   l3.burstiness    std-dev of per-sentence PPL / length         [implemented]
-  l3.fusion        LogisticRegression over the four features above
+  l3.fusion        LogisticRegression over the four above       [implemented]
 
-`zero_width`, `urgency`, `perplexity` and `burstiness` are implemented. Fusion
-stays unimplemented here rather than being stubbed, so that a message analysed
-today carries one honest absence instead of one fabricated 0.0.
+All five signals are implemented. `fusion` is the one that produces a risk
+score: the other four report what was observed, and fusion is the component
+ARCHITECTURE.md gives the job of deciding what those observations are worth.
 
 `zero_width` is the deterministic one: a compiled character class over the
 subject and text body, no model, no corpus, no dependency on anything loaded
@@ -57,6 +57,8 @@ from core.models import DetectionLayer, DetectionSignal, ParsedEmail, RiskLevel
 
 __all__ = [
     "BURSTINESS_MIN_SENTENCES",
+    "FUSION_FEATURE_ORDER",
+    "FUSION_MODEL_PATH",
     "BURSTINESS_MIN_SENTENCE_TOKENS",
     "PERPLEXITY_MAX_TOKENS",
     "PERPLEXITY_MIN_TOKENS",
@@ -70,21 +72,29 @@ __all__ = [
     "ZERO_WIDTH_SCORE",
     "BurstinessResult",
     "CausalLanguageModel",
+    "FusionModel",
+    "FusionUnavailable",
     "PerplexityResult",
     "PerplexityUnavailable",
     "UrgencyModel",
     "UrgencyUnavailable",
     "analyze_burstiness",
+    "analyze_fusion",
     "analyze_perplexity",
     "compute_burstiness",
+    "default_fusion_model",
+    "extract_fusion_features",
     "compute_perplexity",
     "split_sentences",
+    "verdict_thresholds",
     "analyze_urgency",
     "analyze_zero_width",
     "default_perplexity_model",
     "default_urgency_model",
+    "load_fusion_model",
     "load_perplexity_model",
     "load_urgency_model",
+    "reset_default_fusion_model",
     "reset_default_perplexity_model",
     "reset_default_urgency_model",
 ]
@@ -912,4 +922,286 @@ def analyze_burstiness(
         f"{result.length_stddev:.2f} tokens about a mean of {result.mean_length:.1f}. "
         f"These are measurements of the text, not a risk score on their own.",
         metadata=metadata,
+    )
+
+
+# --------------------------------------------------------------------------
+# 5. Fusion
+# --------------------------------------------------------------------------
+#
+# ARCHITECTURE.md section 4: "LogisticRegression over the four features above.
+# Fusion LR replaces hand-summing L3 features."
+#
+# Fusion is the only signal in this layer that emits a risk score. The other
+# four report what was observed - a count, a probability, nats per token, two
+# dispersions - and deliberately decline to say what any of it is worth. This
+# is the component that was fitted to answer that, so this is the one entitled
+# to a number on the 0-1 scale.
+#
+# It **consumes the signals the other four already produced**; it never
+# recomputes a feature. Re-running the language model here would double the
+# layer's cost and, worse, could produce a fusion input that disagrees with the
+# `l3.perplexity` signal shown next to it in the UI.
+
+
+class FusionUnavailable(RuntimeError):
+    """The fusion model could not be used, so nothing was learned.
+
+    Covers both halves of the problem: no usable artifact, and no usable
+    inputs. The caller's decision is the same either way - abstain - and the
+    specific reason belongs in the message, which is what the signal's `error`
+    carries.
+    """
+
+
+@runtime_checkable
+class FusionModel(Protocol):
+    """The whole of what this layer requires of the fusion model.
+
+    Identical in shape to `UrgencyModel`, and kept a separate name rather than
+    aliased: the two are fitted over entirely different feature spaces, and a
+    type that says so is what stops one being passed where the other belongs.
+    """
+
+    classes_: object
+
+    def predict_proba(self, rows: list[list[float]]) -> object: ...
+
+
+# Mirrors `training.train_fusion.FUSION_FEATURE_ORDER`. The two must agree;
+# the order is duplicated rather than imported for the same reason
+# `_PHISH_LABEL` is - importing the training module would drag scikit-learn
+# into every analysis process to read a tuple of four strings.
+FUSION_FEATURE_ORDER = ("zero_width", "urgency", "perplexity", "burstiness")
+
+# Which metadata key each signal contributes. These are the *raw measurements*
+# the four signals already publish, not their scores: fusion was fitted on the
+# observations themselves, and `l3.perplexity` and `l3.burstiness` deliberately
+# carry a score of 0.0, so scoring the scores would feed it two constants.
+#
+# `l3.burstiness` publishes two dispersions and section 4 names four features,
+# so the perplexity dispersion is the one taken here - it is the half that
+# measures how the text was *written* rather than how it was formatted.
+# `length_stddev` stays in the burstiness metadata, unused by this model, and
+# adding it is a refit of `training/train_fusion.py`, not a change here.
+_FUSION_FEATURE_SOURCES = {
+    "zero_width": ("zero_width", "total"),
+    "urgency": ("urgency", "probability"),
+    "perplexity": ("perplexity", "mean_nll"),
+    "burstiness": ("burstiness", "perplexity_stddev"),
+}
+
+# Deliberately not `models/urgency_clf.joblib`. Different model, different
+# feature space; loading one in place of the other would score four numbers
+# through a text vectorizer and fail, or worse, not fail.
+FUSION_MODEL_PATH = Path(__file__).resolve().parent.parent / "models" / "fusion_clf.joblib"
+
+_CONFIG_PATH = Path(__file__).resolve().parent.parent / "config" / "weights.yaml"
+
+_fusion_lock = threading.Lock()
+_fusion_cache: FusionModel | None = None
+
+
+def verdict_thresholds() -> tuple[float, float]:
+    """The (warn, block) bands from config/weights.yaml.
+
+    ARCHITECTURE.md section 6 owns these numbers and `config/weights.yaml`
+    records them; they are read rather than restated so that a retuned band
+    moves this signal's severity with it. A file that cannot be read falls back
+    to the documented Phase A defaults rather than failing the whole signal -
+    a missing config is a reason to use the published thresholds, not a reason
+    to refuse to report a fusion probability that was computed correctly.
+    """
+    try:
+        import yaml
+
+        with open(_CONFIG_PATH, encoding="utf-8") as handle:
+            data = yaml.safe_load(handle) or {}
+        thresholds = data["thresholds"]
+        return float(thresholds["deliver"]), float(thresholds["block"])
+    except Exception:
+        return URGENCY_WARN_THRESHOLD, URGENCY_BLOCK_THRESHOLD
+
+
+def load_fusion_model(path: str | Path | None = None) -> FusionModel:
+    """Load the persisted fusion model from disk. Never fits, never downloads.
+
+    Raises `FusionUnavailable` if the artifact is absent, unreadable, or not
+    something that can produce probabilities.
+    """
+    target = Path(path) if path is not None else FUSION_MODEL_PATH
+
+    if not target.is_file():
+        raise FusionUnavailable(f"no fusion model artifact at {target}")
+
+    try:
+        import joblib
+    except ImportError as exc:  # pragma: no cover - joblib ships with the model deps
+        raise FusionUnavailable(f"joblib is not installed: {exc}") from exc
+
+    try:
+        model = joblib.load(target)
+    except Exception as exc:
+        raise FusionUnavailable(f"fusion model at {target} could not be loaded: {exc}") from exc
+
+    if not hasattr(model, "predict_proba") or not hasattr(model, "classes_"):
+        raise FusionUnavailable(
+            f"artifact at {target} is a {type(model).__name__}, not a probability classifier"
+        )
+    return model
+
+
+def default_fusion_model(path: str | Path | None = None) -> FusionModel:
+    """The process-wide singleton, loaded once. A failed load is not cached."""
+    global _fusion_cache
+    with _fusion_lock:
+        if _fusion_cache is None:
+            _fusion_cache = load_fusion_model(path)
+        return _fusion_cache
+
+
+def reset_default_fusion_model() -> None:
+    """Drop the cached singleton. For tests and for a post-refit reload."""
+    global _fusion_cache
+    with _fusion_lock:
+        _fusion_cache = None
+
+
+def extract_fusion_features(signals: Sequence[DetectionSignal]) -> list[float]:
+    """The four-element feature vector, in `FUSION_FEATURE_ORDER`.
+
+    **An abstaining upstream signal is not a zero.** A signal carrying `error`
+    could not be computed, and substituting 0.0 for it would tell the model
+    "no zero-width characters, calm language, ordinary perplexity" on the
+    strength of an outage. So a missing signal, an abstaining one, or one whose
+    measurement is `None` raises `FusionUnavailable` and the whole fusion
+    abstains - which is the same rule `scoring/composite.py` applies one level
+    up, applied here because a LogisticRegression has no way to express it.
+    """
+    by_name = {signal.name: signal for signal in signals}
+
+    row: list[float] = []
+    for feature in FUSION_FEATURE_ORDER:
+        signal_name, key = _FUSION_FEATURE_SOURCES[feature]
+        signal = by_name.get(signal_name)
+
+        if signal is None:
+            raise FusionUnavailable(f"l3.{signal_name} was not produced")
+        if signal.error is not None:
+            raise FusionUnavailable(f"l3.{signal_name} abstained: {signal.error}")
+
+        value = signal.metadata.get(key)
+        if value is None:
+            raise FusionUnavailable(f"l3.{signal_name} reported no {key}")
+        try:
+            numeric = float(value)
+        except (TypeError, ValueError) as exc:
+            raise FusionUnavailable(
+                f"l3.{signal_name} reported a non-numeric {key}: {value!r}"
+            ) from exc
+        if not math.isfinite(numeric):
+            raise FusionUnavailable(f"l3.{signal_name} reported a non-finite {key}")
+        row.append(numeric)
+
+    return row
+
+
+def _fusion_probability(model: FusionModel, row: list[float]) -> float:
+    """P(phishing) for one feature vector, locating the class by label."""
+    classes = list(getattr(model, "classes_", []))
+    try:
+        column = classes.index(_PHISH_LABEL)
+    except ValueError as exc:
+        raise FusionUnavailable(
+            f"fusion model has no {_PHISH_LABEL!r} class; classes are {classes!r}"
+        ) from exc
+
+    try:
+        probabilities = model.predict_proba([row])[0]
+    except Exception as exc:
+        raise FusionUnavailable(f"fusion model failed to score the features: {exc}") from exc
+
+    try:
+        value = float(probabilities[column])
+    except (IndexError, TypeError, ValueError) as exc:
+        raise FusionUnavailable(f"fusion model returned no usable probability: {exc}") from exc
+
+    if not math.isfinite(value):
+        raise FusionUnavailable("fusion model returned a non-finite probability")
+    return value
+
+
+def analyze_fusion(
+    signals: Sequence[DetectionSignal],
+    *,
+    model: FusionModel | None = None,
+    model_path: str | Path | None = None,
+) -> DetectionSignal:
+    """Combine the four Layer 3 features into one probability.
+
+    `signals` are the signals the other four analyzers already returned; this
+    function recomputes nothing. The score is the fitted model's probability of
+    the phishing class, located through `classes_` by label rather than by
+    column index, and reported as-is - fusion is what ARCHITECTURE.md fitted to
+    put a number on Layer 3, so unlike its inputs it does emit a real score.
+
+    Severity uses the `config/weights.yaml` bands, so this signal's LOW /
+    MEDIUM / HIGH mean what the composite's deliver / warn / block mean.
+
+    Abstains - score 0.0, `fired` False, `error` set - when the model is
+    unavailable or fails, or when **any** input signal abstained. Never treats
+    an absent feature as a zero. Never raises, and never opens a socket.
+    """
+    metadata: dict[str, object] = {
+        "probability": None,
+        "features": None,
+        "feature_order": list(FUSION_FEATURE_ORDER),
+    }
+
+    try:
+        row = extract_fusion_features(signals)
+        fusion_model = model if model is not None else default_fusion_model(model_path)
+        probability = _fusion_probability(fusion_model, row)
+    except FusionUnavailable as exc:
+        return DetectionSignal(
+            layer=DetectionLayer.L3,
+            name="fusion",
+            score=0.0,
+            severity=RiskLevel.LOW,
+            evidence=(
+                f"Layer 3's features could not be combined into a verdict "
+                f"({exc}). This is an absence of information, not a clean "
+                f"result: the message was not judged either way."
+            ),
+            metadata={**metadata, "fired": False},
+            error=str(exc),
+        )
+
+    score = min(1.0, max(0.0, probability))
+    warn, block = verdict_thresholds()
+    if score >= block:
+        severity = RiskLevel.HIGH
+    elif score >= warn:
+        severity = RiskLevel.MEDIUM
+    else:
+        severity = RiskLevel.LOW
+
+    described = ", ".join(
+        f"{name}={value:.3g}" for name, value in zip(FUSION_FEATURE_ORDER, row)
+    )
+    return DetectionSignal(
+        layer=DetectionLayer.L3,
+        name="fusion",
+        score=score,
+        severity=severity,
+        evidence=(
+            f"Layer 3's fitted model puts this message at {score:.2f} on the "
+            f"phishing scale, combining {described}."
+        ),
+        metadata={
+            **metadata,
+            "probability": score,
+            "features": dict(zip(FUSION_FEATURE_ORDER, row)),
+            "fired": score > 0.0,
+        },
     )
