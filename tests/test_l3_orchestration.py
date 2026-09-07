@@ -222,7 +222,7 @@ async def test_a_slow_layer_three_is_bounded_by_its_own_timeout(email) -> None:
 
 
 @pytest.mark.asyncio
-async def test_layer_one_and_the_unwritten_layers_are_unchanged(email) -> None:
+async def test_layer_one_and_the_other_layers_are_unchanged(email) -> None:
     results = await run_layers(email, layers={DetectionLayer.L3: wired()})
     by_layer = {r.layer: r for r in results}
 
@@ -235,9 +235,11 @@ async def test_layer_one_and_the_unwritten_layers_are_unchanged(email) -> None:
         "domain_age_lt_7d",
         "display_name_impersonation",
     ]
-    for layer in (DetectionLayer.L2, DetectionLayer.L4):
-        assert by_layer[layer].completed is False
-        assert "not implemented" in by_layer[layer].error
+    assert by_layer[DetectionLayer.L2].completed is False
+    assert "not implemented" in by_layer[DetectionLayer.L2].error
+    # L4 is written now; this message's URLs are not checkable without feeds.
+    assert by_layer[DetectionLayer.L4].completed is False
+    assert by_layer[DetectionLayer.L4].error is not None
 
 
 @pytest.mark.asyncio
