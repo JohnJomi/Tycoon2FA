@@ -57,7 +57,13 @@ from bs4 import BeautifulSoup
 
 from core.models import Attachment, ExtractedURL, ParsedEmail, URLSource
 
-__all__ = ["EmailParseError", "parse_email"]
+__all__ = [
+    "MAX_ATTACHMENT_PAYLOAD_BYTES",
+    "AttachmentPayloadUnavailable",
+    "EmailParseError",
+    "attachment_payload",
+    "parse_email",
+]
 
 
 class EmailParseError(ValueError):
@@ -545,3 +551,160 @@ def _extract_attachments(message: Message) -> list[Attachment]:
             )
         )
     return attachments
+
+
+# --------------------------------------------------------------------------
+# Attachment payloads
+# --------------------------------------------------------------------------
+#
+# ARCHITECTURE.md section 2 is explicit that `Attachment` is metadata only and
+# that "the payload is deliberately not carried on the contract." That stays
+# true: nothing below adds a field to `Attachment`, and no second attachment
+# model is introduced.
+#
+# The bytes were never lost. `ParsedEmail.raw` already carries the original
+# RFC-822 message, and `_extract_attachments` already walks it to build the
+# metadata list. So retrieving one attachment's payload is a matter of walking
+# the same tree the same way and stopping at the same part - which is what
+# `attachment_payload` does. The payload exists once, inside `raw`, and is
+# decoded on demand rather than held a second time on every `ParsedEmail`.
+#
+# This is what `layers.l2_urls.QRDecoder` is waiting for: its contract takes
+# `decode(payload, attachment)` precisely because the payload is passed in
+# rather than carried. Nothing here decodes anything, imports `pyzbar`, or
+# knows what a QR code is - the image-format question belongs to Layer 2,
+# which already has `QR_IMAGE_CONTENT_TYPES` for it.
+
+# A ceiling on what will be decoded into memory for one attachment.
+#
+# **Not specified by ARCHITECTURE.md**, which sets no attachment size limit
+# anywhere. It exists because this function turns a byte range of a message
+# into a separate allocation on request, and an unbounded one is a way to spend
+# a lot of memory on a hostile message. 16 MiB is far above any plausible
+# QR-bearing image and far below anything that threatens a process; a caller
+# that needs a different bound passes `max_bytes`.
+MAX_ATTACHMENT_PAYLOAD_BYTES = 16 * 1024 * 1024
+
+
+class AttachmentPayloadUnavailable(LookupError):
+    """The bytes for an attachment could not be produced.
+
+    Raised - rather than returning None - so "this attachment has no payload I
+    can give you" cannot be confused with "this attachment is an empty file",
+    which is a real and different thing a message can contain. The caller
+    abstains; `QRDecodeResult` has `NOT_ATTEMPTED` and `UNREADABLE` for exactly
+    these two shapes.
+    """
+
+
+def attachment_payload(
+    email: ParsedEmail,
+    attachment: Attachment,
+    *,
+    max_bytes: int = MAX_ATTACHMENT_PAYLOAD_BYTES,
+) -> bytes:
+    """The decoded bytes of one attachment of `email`.
+
+    The attachment is identified by its position in `email.attachments`, which
+    is the order `_extract_attachments` produced by walking the message. That
+    ordinal is the mapping: two attachments sharing a filename, a content type
+    and a size are still distinct parts in distinct positions, and matching on
+    metadata alone would hand back the wrong one. Identity (`is`) is tried
+    first, so the ordinary case of passing back an object from the list is
+    exact; an equal-but-not-identical `Attachment` falls back to the first
+    equal entry.
+
+    Raises `AttachmentPayloadUnavailable` when the bytes cannot be produced:
+    no `raw` on the message (a `ParsedEmail` built directly in a test or by a
+    source that did not keep it), an attachment that is not one of this
+    message's, a message that will not re-parse, a part whose payload cannot be
+    decoded, or a payload above `max_bytes`. Never raises anything else, and
+    never returns a partial or substituted payload.
+
+    An **empty** attachment returns `b""` - a real answer about a real empty
+    part, which is why the failure path raises instead of returning None.
+
+    Offline: this re-reads bytes the message already contained. It fetches
+    nothing, follows nothing, and never touches an externally referenced image.
+    """
+    if not isinstance(attachment, Attachment):
+        raise TypeError(f"attachment must be an Attachment, got {type(attachment).__name__}")
+    if max_bytes <= 0:
+        raise ValueError(f"max_bytes must be positive, got {max_bytes!r}")
+
+    index = _attachment_index(email, attachment)
+    if index is None:
+        raise AttachmentPayloadUnavailable(
+            f"{attachment.filename or '<unnamed>'} is not an attachment of this message"
+        )
+
+    if not email.raw:
+        raise AttachmentPayloadUnavailable(
+            "the message carries no raw bytes, so no payload can be recovered"
+        )
+
+    try:
+        message = _parse_message(email.raw)
+    except Exception as exc:  # noqa: BLE001 - a message that will not re-parse
+        raise AttachmentPayloadUnavailable(f"the message could not be re-parsed: {exc}") from exc
+
+    part = _attachment_part_at(message, index)
+    if part is None:
+        raise AttachmentPayloadUnavailable(
+            f"attachment {index} is no longer present in the message"
+        )
+
+    try:
+        payload = part.get_payload(decode=True)
+    except Exception as exc:  # noqa: BLE001 - malformed base64, broken encoding
+        raise AttachmentPayloadUnavailable(
+            f"the payload of {attachment.filename or '<unnamed>'} could not be decoded: {exc}"
+        ) from exc
+
+    if not isinstance(payload, (bytes, bytearray)):
+        raise AttachmentPayloadUnavailable(
+            f"{attachment.filename or '<unnamed>'} has no decodable payload"
+        )
+    if len(payload) > max_bytes:
+        raise AttachmentPayloadUnavailable(
+            f"{attachment.filename or '<unnamed>'} is {len(payload)} bytes, above the "
+            f"{max_bytes}-byte limit"
+        )
+    return bytes(payload)
+
+
+def _attachment_index(email: ParsedEmail, attachment: Attachment) -> int | None:
+    """Position of `attachment` in the message's attachment list, or None."""
+    for index, candidate in enumerate(email.attachments):
+        if candidate is attachment:
+            return index
+    for index, candidate in enumerate(email.attachments):
+        if candidate == attachment:
+            return index
+    return None
+
+
+def _attachment_part_at(message: Message, index: int) -> Message | None:
+    """The n-th part `_extract_attachments` would have recorded.
+
+    Walks with exactly the same filters, so the ordinal means the same thing on
+    both sides. Degrades to None rather than raising on hostile MIME.
+    """
+    try:
+        parts = list(message.walk())
+    except Exception:  # noqa: BLE001
+        return None
+
+    seen = -1
+    for part in parts:
+        try:
+            if part.get_content_maintype() == "multipart":
+                continue
+        except Exception:  # noqa: BLE001, S112
+            continue
+        if not _is_attachment_part(part):
+            continue
+        seen += 1
+        if seen == index:
+            return part
+    return None
