@@ -68,10 +68,11 @@ from core.models import (
     RiskLevel,
     URLSource,
 )
-from layers.l1_headers import registrable_domain
+from layers.l1_headers import BRAND_DOMAINS, registrable_domain
 
 __all__ = [
     "BASE64_EMAIL_PARAM_SCORE",
+    "BRAND_MISMATCH_SCORE",
     "DEFAULT_PORTS",
     "REDIRECT_CAPPED_SCORE",
     "REDIRECT_DEPTH_SCORE",
@@ -83,6 +84,8 @@ __all__ = [
     "RedirectTrace",
     "URLCandidate",
     "analyze_base64_email_param",
+    "analyze_domain_mismatch_brand",
+    "brands_named_in",
     "analyze_redirect_depth",
     "decode_base64_email",
     "candidate_urls",
@@ -1011,6 +1014,257 @@ def _base64_signal(
     return DetectionSignal(
         layer=DetectionLayer.L2,
         name="base64_email_param",
+        score=score,
+        severity=severity,
+        evidence=evidence,
+        metadata={**metadata, "fired": score > 0.0 and error is None},
+        error=error,
+    )
+
+
+# --------------------------------------------------------------------------
+# l2.domain_mismatch_brand
+# --------------------------------------------------------------------------
+#
+# ARCHITECTURE.md section 4: "Anchor text names a brand, href points
+# elsewhere."
+#
+# The brand corpus is `l1_headers.BRAND_DOMAINS`, imported rather than
+# duplicated. It is already exactly the mapping this signal needs - brand token
+# to the set of registrable domains that brand legitimately uses - and it is
+# the only brand data in the repository. A second list would drift from the
+# first, and the two signals would then disagree about who Microsoft is.
+#
+# Section 4 does not say which corpus Layer 2 should use; see the report. The
+# reuse is a judgement, but it is the only one available that does not mean
+# inventing a brand database.
+#
+# The rule is the same shape as `l1.display_name_impersonation`, deliberately:
+# a fixed table, exact token matching after a fixed normalization, no edit
+# distance and no similarity threshold. Fuzzy matching loose enough to catch
+# real attacks is loose enough to call "Apple Valley Dental" an impersonation.
+#
+# **Why this does not fire on every anchor/domain mismatch.** A legitimate
+# branded link routinely points at a third party - an ESP click-tracker, a
+# CDN, a survey host - so "the domains differ" is not the finding. Two
+# restraints, both taken from the Layer 1 signal's existing behaviour:
+#
+#   1. The anchor must *name* a brand as a token, not merely contain the
+#      letters. "Click here to view your invoice" names nothing.
+#   2. A destination whose own registrable domain carries the brand token does
+#      not fire. `microsoft.com.evil.example` is caught by the domain check;
+#      `microsoft-partner.co.uk` degrades to silence rather than to a false
+#      accusation, which is how the Layer 1 signal handles a legitimate but
+#      unlisted brand domain.
+#
+# That leaves a real residual false-positive surface - a genuine Microsoft mail
+# whose link goes through an unlisted tracker still fires - which is why the
+# score below is corroborating rather than conclusive.
+
+# Same normalization as the Layer 1 signal's, applied to anchor text instead of
+# to a display name. Not imported: the Layer 1 helpers are private to that
+# module, and importing them would couple two signals through an unpublished
+# interface. `BRAND_DOMAINS` is the shared thing, and it is public.
+_ANCHOR_SPLIT_RE = re.compile(r"[^a-z0-9]+")
+
+# **Not specified by ARCHITECTURE.md.** Section 4's Layer 2 table has no
+# severity column and config/weights.yaml carries no per-signal scores, so this
+# is hand-assigned for Phase A on the same terms as every other score in this
+# project and refitted in Phase 5.
+#
+# 0.60, below the 0.65 block band and below `l2.base64_email_param`'s 0.70. A
+# branded anchor pointing off-brand is a classic phishing shape, but the
+# residual false positive above is real and common in legitimate bulk mail, so
+# this corroborates rather than convicts. Note section 4 rates the analogous
+# `l1.display_name_impersonation` "medium", which is the band this lands in.
+BRAND_MISMATCH_SCORE = 0.60
+
+
+def brands_named_in(anchor_text: str | None) -> list[str]:
+    """The brands an anchor text names, in `BRAND_DOMAINS` order.
+
+    Tokens are the folded words, adjacent pairs and the whole string joined -
+    so "Micro Soft" and "Pay Pal" are caught, without matching two words that
+    merely both appear somewhere in a long sentence. Deterministic, and empty
+    for None, blank, or text naming nothing.
+    """
+    if not anchor_text or not anchor_text.strip():
+        return []
+
+    words = [w for w in _ANCHOR_SPLIT_RE.split(anchor_text.lower()) if w]
+    if not words:
+        return []
+
+    tokens = set(words)
+    tokens.update(a + b for a, b in zip(words, words[1:]))
+    if len(words) > 1:
+        tokens.add("".join(words))
+
+    return [brand for brand in BRAND_DOMAINS if brand in tokens]
+
+
+def _brand_verdict(candidate: URLCandidate) -> tuple[str, dict[str, object]] | None:
+    """Classify one candidate, or None when its anchor names no brand.
+
+    Returns `(verdict, detail)` where verdict is "mismatch", "legitimate" or
+    "uncomparable" - the last when the anchor claims a brand but the href has
+    no registrable domain to check it against, which is an absence of
+    information rather than a clean link.
+    """
+    brands = brands_named_in(candidate.anchor_text)
+    if not brands:
+        return None
+
+    detail: dict[str, object] = {
+        "url": candidate.raw,
+        "anchor_text": (candidate.anchor_text or "").strip(),
+        "brands": brands,
+        "destination": candidate.registrable,
+    }
+
+    if candidate.registrable is None:
+        return "uncomparable", detail
+
+    for brand in brands:
+        if candidate.registrable in BRAND_DOMAINS[brand]:
+            return "legitimate", {**detail, "matched_brand": brand}
+        if brand in candidate.registrable:
+            # The destination carries the brand token itself: an unlisted but
+            # plausibly legitimate domain. Silence, not an accusation.
+            return "legitimate", {**detail, "matched_brand": brand}
+
+    return "mismatch", detail
+
+
+def analyze_domain_mismatch_brand(
+    email: ParsedEmail,
+    *,
+    extra: Sequence[ExtractedURL] = (),
+) -> DetectionSignal:
+    """Flag links whose anchor text names a brand the destination is not.
+
+    "Sign in to Microsoft" pointing at `secure-login.tk` fires; the same anchor
+    pointing at `microsoftonline.com` does not, and neither does "Click here"
+    pointing anywhere. Each candidate is judged independently, so one link with
+    no anchor text costs that link alone.
+
+    Offline: a fixed table and exact token matching. No DNS, no request, no
+    rendering. Never raises.
+
+    Evidence names the brand the anchor claimed, the registrable domain the
+    href actually points to, and why those disagree. It quotes `candidate.raw`
+    and the anchor text and nothing else about the URL - query parameters are
+    not this signal's business and may carry tokens.
+
+    Abstains when a branded anchor's destination has no registrable domain to
+    compare against - an IP-literal href under a brand anchor is not a clean
+    link, it is an unanswerable one - and only when no other link produced a
+    finding.
+    """
+    candidates = candidate_urls(email, extra=extra)
+
+    metadata: dict[str, object] = {
+        "urls_in_message": len(email.urls),
+        "urls_checked": len(candidates),
+        "branded_anchors": 0,
+        "matches": [],
+        "legitimate": [],
+        "uncomparable": [],
+    }
+
+    if not candidates:
+        return _brand_signal(
+            0.0,
+            RiskLevel.LOW,
+            "The message contains no analysable URLs, so no anchor text could "
+            "misrepresent a destination.",
+            metadata=metadata,
+        )
+
+    matches: list[dict[str, object]] = []
+    legitimate: list[dict[str, object]] = []
+    uncomparable: list[dict[str, object]] = []
+
+    for candidate in candidates:
+        verdict = _brand_verdict(candidate)
+        if verdict is None:
+            continue
+        outcome, detail = verdict
+        if outcome == "mismatch":
+            matches.append(detail)
+        elif outcome == "legitimate":
+            legitimate.append(detail)
+        else:
+            uncomparable.append(detail)
+
+    metadata.update(
+        branded_anchors=len(matches) + len(legitimate) + len(uncomparable),
+        matches=matches,
+        legitimate=legitimate,
+        uncomparable=uncomparable,
+    )
+
+    if matches:
+        described = "; ".join(
+            f"{match['anchor_text']!r} names {match['brands'][0]} but "
+            f"{match['url']} points to {match['destination']}"
+            for match in matches[:3]
+        )
+        more = f", and {len(matches) - 3} more" if len(matches) > 3 else ""
+        return _brand_signal(
+            BRAND_MISMATCH_SCORE,
+            _severity(BRAND_MISMATCH_SCORE),
+            f"{len(matches)} link(s) in this message name a brand in their text "
+            f"while pointing at a domain that brand does not use: {described}"
+            f"{more}.",
+            metadata=metadata,
+        )
+
+    if uncomparable:
+        listed = "; ".join(
+            f"{item['anchor_text']!r} names {item['brands'][0]} but {item['url']} "
+            f"has no registrable domain"
+            for item in uncomparable[:3]
+        )
+        return _brand_signal(
+            0.0,
+            RiskLevel.LOW,
+            f"{len(uncomparable)} branded link(s) point at a destination with no "
+            f"registrable domain, so the claim could not be checked ({listed}). "
+            f"This is an absence of information, not a clean result.",
+            metadata=metadata,
+            error=f"{len(uncomparable)} branded link(s) had no comparable domain",
+        )
+
+    if legitimate:
+        return _brand_signal(
+            0.0,
+            RiskLevel.LOW,
+            f"{len(legitimate)} link(s) name a brand and point at a domain that "
+            f"brand uses; none misrepresents its destination.",
+            metadata=metadata,
+        )
+
+    return _brand_signal(
+        0.0,
+        RiskLevel.LOW,
+        f"No link text in this message names a known brand, so none could "
+        f"misrepresent its destination.",
+        metadata=metadata,
+    )
+
+
+def _brand_signal(
+    score: float,
+    severity: RiskLevel,
+    evidence: str,
+    *,
+    metadata: dict[str, object],
+    error: str | None = None,
+) -> DetectionSignal:
+    return DetectionSignal(
+        layer=DetectionLayer.L2,
+        name="domain_mismatch_brand",
         score=score,
         severity=severity,
         evidence=evidence,
