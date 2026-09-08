@@ -366,8 +366,11 @@ async def test_the_other_layers_behave_as_before(email) -> None:
         "domain_age_lt_7d",
         "display_name_impersonation",
     ]
+    # Layer 2 is written now, but this machine has no redirect egress, no
+    # browser and no QR decoder, so it learns nothing and says so. Still
+    # incomplete - the state whose weight scoring redistributes.
     assert by_layer[DetectionLayer.L2].completed is False
-    assert "not implemented" in by_layer[DetectionLayer.L2].error
+    assert "Layer2Uninformative" in by_layer[DetectionLayer.L2].error
     # L3 is written but has no model artifacts here.
     assert by_layer[DetectionLayer.L3].completed is False
 

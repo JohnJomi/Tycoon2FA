@@ -804,6 +804,10 @@ def test_a_transport_failure_is_not_an_answer_about_the_domain(monkeypatch):
 
 def test_a_record_with_a_creation_date_is_returned(monkeypatch):
     class Record:
+        # `_record_domains` fails closed: a record is accepted only when it
+        # names the domain that was asked about. A record naming nothing is
+        # unverifiable, which `test_l1_domain_signals.py` covers directly.
+        domain_name = "corp.com"
         creation_date = datetime(2020, 1, 2, tzinfo=timezone.utc)
 
     _stub_whois_module(monkeypatch, record=Record())
@@ -864,17 +868,27 @@ async def test_unwritten_layers_report_incomplete_rather_than_clean():
 
 @pytest.mark.asyncio
 async def test_a_layer_one_finding_is_not_diluted_by_the_unwritten_layers():
-    """The regression: this composite was 0.255/LOW when L2-L4 claimed to complete."""
+    """The regression: this composite was 0.255/LOW when L2-L4 claimed to complete.
+
+    L2 is written now, and this message has no URLs and no images, so it
+    genuinely completes: it examined the URL surface, found nothing on it to
+    inspect, and reached that answer with nothing missing. That is a real
+    negative and does consume L2's 0.30 - see `Layer2Uninformative`. So L1 and
+    L2 renormalize to 0.5 each and the composite is 0.425/MEDIUM.
+
+    The regression this guards is unchanged: L3 and L4 learned nothing and
+    carry no weight. What is excluded is a layer claiming a clean result it did
+    not earn, not a layer reporting one it did.
+    """
     from scoring.composite import score
 
     results = await run_layers(_dmarc_failing_email())
     assessment = score("<dmarc-fail@example.com>", results)
 
-    assert [r.completed for r in results] == [True, False, False, False]
-    assert assessment.layers_completed == [DetectionLayer.L1]
-    # L1's weight renormalizes to 1.0, so the layer score reaches the composite.
-    assert assessment.score == pytest.approx(0.85)
-    assert assessment.level is RiskLevel.HIGH
+    assert [r.completed for r in results] == [True, True, False, False]
+    assert assessment.layers_completed == [DetectionLayer.L1, DetectionLayer.L2]
+    assert assessment.score == pytest.approx(0.425)
+    assert assessment.level is RiskLevel.MEDIUM
 
 
 @pytest.mark.asyncio
@@ -884,18 +898,33 @@ async def test_the_unwritten_layers_carry_no_scoring_weight():
     results = await run_layers(_dmarc_failing_email())
     contributions = layer_contributions(results)
 
-    assert set(contributions) == {DetectionLayer.L1}
-    assert DetectionLayer.L2 not in contributions
+    # L3 and L4 learned nothing, so they contribute nothing. L2 completed on a
+    # message with no URL surface, so it contributes - at 0.0, which is the
+    # clean result it actually reached rather than a claim it did not earn.
+    assert set(contributions) == {DetectionLayer.L1, DetectionLayer.L2}
+    assert contributions[DetectionLayer.L2] == 0.0
+    assert DetectionLayer.L3 not in contributions
+    assert DetectionLayer.L4 not in contributions
 
 
 @pytest.mark.asyncio
 async def test_an_unwritten_layer_is_never_reported_as_a_clean_result():
     results = await run_layers(_dmarc_failing_email())
+    by_layer = {result.layer: result for result in results}
 
-    for result in results[1:]:
-        assert result.completed is False
-        assert result.signals == []      # no fake signals were invented
-        assert result.error is not None  # and the reason is stated
+    # L3 and L4 have no model artifacts, feeds or ASN resolver on this machine,
+    # so neither reached a conclusion and neither may look clean.
+    for layer in (DetectionLayer.L3, DetectionLayer.L4):
+        assert by_layer[layer].completed is False
+        assert by_layer[layer].signals == []      # no fake signals were invented
+        assert by_layer[layer].error is not None  # and the reason is stated
+
+    # L2 is the contrast: it completed because it genuinely had nothing to
+    # inspect, and it says so with real signals rather than an empty list.
+    l2 = by_layer[DetectionLayer.L2]
+    assert l2.completed is True
+    assert l2.error is None
+    assert all(signal.score == 0.0 for signal in l2.signals)
 
 
 # --------------------------------------------------------------------------

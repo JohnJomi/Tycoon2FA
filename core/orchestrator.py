@@ -16,11 +16,12 @@ way to scoring, because collapsing them turns an outage into an all-clear.
 Scope: this module runs layers and reports what happened. It does not score,
 does not decide a verdict, and does not know what any layer looks for.
 
-Layers 1, 3 and 4 are real: `DEFAULT_LAYERS` points at each layer's own async
-adapter. Layer 2 is not written yet, and says so: they report `completed=False`, which is the same state a timeout
+All four layers are real: `DEFAULT_LAYERS` points at each layer's own async
+adapter. A layer that ran but learned nothing raises its own `Uninformative`
+error and so reports `completed=False`, which is the same state a timeout
 produces and means "no information", not "nothing found". Scoring then
-redistributes their weight onto the layers that did run, so an unwritten layer
-cannot dilute a real finding.
+redistributes its weight onto the layers that did run, so a layer whose
+dependencies are missing cannot dilute a real finding.
 """
 
 from __future__ import annotations
@@ -30,7 +31,7 @@ import time
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 
 from core.models import DetectionLayer, DetectionSignal, LayerResult, ParsedEmail
-from layers import l1_headers, l3_nlp, l4_intel
+from layers import l1_headers, l2_urls, l3_nlp, l4_intel
 
 __all__ = [
     "DEFAULT_LAYERS",
@@ -188,7 +189,7 @@ async def run_layers(
 # --------------------------------------------------------------------------
 # The layer mapping
 #
-# L1, L3 and L4 are the real implementations. L2 is not written yet.
+# L1, L2, L3 and L4 are all real implementations.
 #
 # An unwritten layer must not return `[]`. A layer that completes with no
 # signals is making a claim - "I ran, and I found nothing" - and scoring counts
@@ -223,13 +224,18 @@ def unimplemented_layer(layer: DetectionLayer, description: str) -> LayerCallabl
     return run
 
 
-# `analyze_async` is Layer 1's own adapter onto LayerCallable, and every
-# argument beyond the email defaults: the WHOIS client, its timeout and the
-# shared cache are the layer's decisions, not the orchestrator's. This module
-# still knows nothing about what any layer looks for.
+# `analyze_async` is each layer's own adapter onto LayerCallable, and every
+# argument beyond the email defaults: the WHOIS client and its timeout, Layer
+# 2's redirect follower, page renderer and QR decoder, the shared cache - all
+# are the layer's decisions, not the orchestrator's. This module still knows
+# nothing about what any layer looks for.
+#
+# `unimplemented_layer` is kept: no layer uses it now, but it is the vocabulary
+# for a layer that has not been written, and deleting it would leave the next
+# one with nothing to say but `[]`.
 DEFAULT_LAYERS: Mapping[DetectionLayer, LayerCallable] = {
     DetectionLayer.L1: l1_headers.analyze_async,
-    DetectionLayer.L2: unimplemented_layer(DetectionLayer.L2, "URL & redirect chain"),
+    DetectionLayer.L2: l2_urls.analyze_async,
     DetectionLayer.L3: l3_nlp.analyze_async,
     DetectionLayer.L4: l4_intel.analyze_async,
 }

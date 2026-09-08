@@ -212,27 +212,33 @@ async def test_default_l1_emits_no_stub_signal(email):
 
 
 @pytest.mark.asyncio
-async def test_the_unwritten_layers_report_themselves_as_unimplemented(email):
-    """An unwritten layer must not look like a layer that ran and found nothing.
+async def test_a_layer_that_learned_nothing_does_not_look_clean(email):
+    """A layer that learned nothing must not look like one that found nothing.
 
     `completed=True` with no signals is a claim of innocence that scoring counts
     at the layer's full weight; `completed=False` means "no information" and
     gets its weight redistributed onto the layers that did run.
+
+    All four layers are written now. This machine has no model artifacts, no
+    feeds and no ASN resolver, so L3 and L4 report incomplete for their own
+    reasons - still "no information", never a clean 0.0. Neither is
+    unimplemented any more.
+
+    L2 is the contrast, and it is deliberate: this message has no URLs and no
+    images, so Layer 2 examined the URL surface, found nothing on it to
+    inspect, and reached that answer with nothing missing. That is a genuine
+    negative rather than an absence of information, so it completes.
     """
     results = _by_layer(await run_layers(email))
 
-    assert results[DetectionLayer.L2].completed is False
-    assert results[DetectionLayer.L2].signals == []
-    assert "not implemented" in results[DetectionLayer.L2].error
-
-    # L3 and L4 are written. This message has no URLs and this machine has no
-    # model artifacts, so every one of their signals abstains or has nothing to
-    # examine: they report incomplete for their own reasons rather than for the
-    # unwritten-layer one - still "no information", never a clean 0.0.
     for layer in (DetectionLayer.L3, DetectionLayer.L4):
         assert results[layer].completed is False
         assert results[layer].signals == []
         assert "not implemented" not in results[layer].error
+
+    assert results[DetectionLayer.L2].completed is True
+    assert results[DetectionLayer.L2].error is None
+    assert all(s.score == 0.0 for s in results[DetectionLayer.L2].signals)
 
 
 @pytest.mark.asyncio

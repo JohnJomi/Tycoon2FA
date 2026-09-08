@@ -52,6 +52,7 @@ definition, and a parser that improvises on it produces confident nonsense.
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import binascii
 import re
@@ -73,6 +74,14 @@ from layers.l1_headers import BRAND_DOMAINS, registrable_domain
 
 __all__ = [
     "BASE64_EMAIL_PARAM_SCORE",
+    "MAX_RENDERED_PAGES_PER_EMAIL",
+    "Layer2Uninformative",
+    "analyze",
+    "analyze_async",
+    "decode_qr_attachments",
+    "follow_candidates",
+    "qr_extracted_urls",
+    "CAPTCHA_GATE_SCORE",
     "QR_URL_SCORE",
     "QRDecodeResult",
     "QRDecoder",
@@ -97,9 +106,11 @@ __all__ = [
     "RedirectTrace",
     "URLCandidate",
     "analyze_base64_email_param",
+    "analyze_captcha_gate",
     "analyze_domain_mismatch_brand",
     "analyze_qr_url",
     "eligible_qr_attachments",
+    "terminal_urls",
     "brands_named_in",
     "analyze_redirect_depth",
     "decode_base64_email",
@@ -625,11 +636,62 @@ def _describe(trace: RedirectTrace) -> dict[str, object]:
     }
 
 
+def follow_candidates(
+    candidates: Sequence[URLCandidate],
+    follower: RedirectFollower | None,
+) -> list[RedirectTrace]:
+    """Walk every candidate once, in order, and return one trace per candidate.
+
+    The single place in this layer that calls a `RedirectFollower`. Extracted
+    from `analyze_redirect_depth` so the layer entry point can walk each URL
+    exactly once and hand the *same* trace objects to both `l2.redirect_depth`
+    and `l2.captcha_gate` - the two signals that read them - rather than each
+    signal following the same attacker-controlled chain again.
+
+    Sequential by design: these are requests to infrastructure the attacker
+    controls, and fanning them out concurrently would multiply the load this
+    layer puts on it while making the layer's own budget impossible to reason
+    about.
+
+    Never raises. A follower that raises, or that returns something other than
+    a `RedirectTrace`, is broken rather than authoritative and is recorded as
+    `UNREACHABLE`; with no follower at all every candidate gets a
+    `NOT_ATTEMPTED` trace, which is an absence of information and not a depth
+    of 0.
+    """
+    traces: list[RedirectTrace] = []
+    for candidate in candidates:
+        if follower is None:
+            traces.append(
+                RedirectTrace.not_attempted(candidate.raw, "no redirect follower configured")
+            )
+            continue
+        try:
+            trace = follower.follow(candidate.raw)
+        except Exception as exc:  # noqa: BLE001 - the seam forbids this, so a
+            # follower that raises is broken rather than authoritative.
+            trace = RedirectTrace(
+                url=candidate.raw,
+                outcome=RedirectOutcome.UNREACHABLE,
+                error=f"follower raised {type(exc).__name__}: {exc}",
+            )
+        if not isinstance(trace, RedirectTrace):
+            trace = RedirectTrace(
+                url=candidate.raw,
+                outcome=RedirectOutcome.UNREACHABLE,
+                error=f"follower returned {type(trace).__name__}, not a RedirectTrace",
+            )
+        traces.append(trace)
+    return traces
+
+
 def analyze_redirect_depth(
     email: ParsedEmail,
     *,
     follower: RedirectFollower | None = None,
     extra: Sequence[ExtractedURL] = (),
+    candidates: Sequence[URLCandidate] | None = None,
+    traces: Sequence[RedirectTrace] | None = None,
 ) -> DetectionSignal:
     """Flag messages whose links redirect more than twice before landing.
 
@@ -655,8 +717,17 @@ def analyze_redirect_depth(
 
     Never raises. Never opens a socket, resolves a name or follows a redirect:
     all of that is the injected follower's job, behind the seam.
+
+    `candidates` and `traces` are the integration seam the layer entry point
+    uses: both default to None and are then computed exactly as before, so a
+    caller that passes neither sees the behaviour this signal has always had.
+    Passing them lets `layers.l2_urls.analyze` compute the candidate set once
+    and walk each URL once for the whole layer, instead of every signal
+    rebuilding the set and re-walking the same attacker-controlled chains.
     """
-    candidates = candidate_urls(email, extra=extra)
+    candidates = (
+        list(candidates) if candidates is not None else candidate_urls(email, extra=extra)
+    )
 
     metadata: dict[str, object] = {
         "urls_in_message": len(email.urls),
@@ -681,29 +752,9 @@ def analyze_redirect_depth(
 
     metadata["urls_checked"] = len(candidates)
 
-    traces: list[RedirectTrace] = []
-    for candidate in candidates:
-        if follower is None:
-            traces.append(
-                RedirectTrace.not_attempted(candidate.raw, "no redirect follower configured")
-            )
-            continue
-        try:
-            trace = follower.follow(candidate.raw)
-        except Exception as exc:  # noqa: BLE001 - the seam forbids this, so a
-            # follower that raises is broken rather than authoritative.
-            trace = RedirectTrace(
-                url=candidate.raw,
-                outcome=RedirectOutcome.UNREACHABLE,
-                error=f"follower raised {type(exc).__name__}: {exc}",
-            )
-        if not isinstance(trace, RedirectTrace):
-            trace = RedirectTrace(
-                url=candidate.raw,
-                outcome=RedirectOutcome.UNREACHABLE,
-                error=f"follower returned {type(trace).__name__}, not a RedirectTrace",
-            )
-        traces.append(trace)
+    traces = (
+        list(traces) if traces is not None else follow_candidates(candidates, follower)
+    )
 
     answered = [trace for trace in traces if trace.is_answer]
     abstained = {trace.url: (trace.error or "not followed") for trace in traces if not trace.is_answer}
@@ -936,6 +987,7 @@ def analyze_base64_email_param(
     email: ParsedEmail,
     *,
     extra: Sequence[ExtractedURL] = (),
+    candidates: Sequence[URLCandidate] | None = None,
 ) -> DetectionSignal:
     """Flag URLs carrying a base64-encoded recipient address.
 
@@ -957,8 +1009,13 @@ def analyze_base64_email_param(
     not, and "no encoded address" is a genuine negative rather than an absence
     of information. That is the whole difference between an offline signal and
     `l2.redirect_depth`.
+
+    `candidates` is the shared-candidate seam described on
+    `analyze_redirect_depth`: None recomputes the set exactly as before.
     """
-    candidates = candidate_urls(email, extra=extra)
+    candidates = (
+        list(candidates) if candidates is not None else candidate_urls(email, extra=extra)
+    )
 
     metadata: dict[str, object] = {
         "urls_in_message": len(email.urls),
@@ -1155,6 +1212,7 @@ def analyze_domain_mismatch_brand(
     email: ParsedEmail,
     *,
     extra: Sequence[ExtractedURL] = (),
+    candidates: Sequence[URLCandidate] | None = None,
 ) -> DetectionSignal:
     """Flag links whose anchor text names a brand the destination is not.
 
@@ -1175,8 +1233,13 @@ def analyze_domain_mismatch_brand(
     compare against - an IP-literal href under a brand anchor is not a clean
     link, it is an unanswerable one - and only when no other link produced a
     finding.
+
+    `candidates` is the shared-candidate seam described on
+    `analyze_redirect_depth`: None recomputes the set exactly as before.
     """
-    candidates = candidate_urls(email, extra=extra)
+    candidates = (
+        list(candidates) if candidates is not None else candidate_urls(email, extra=extra)
+    )
 
     metadata: dict[str, object] = {
         "urls_in_message": len(email.urls),
@@ -1840,11 +1903,52 @@ def _decode_attachment(
     return result
 
 
+def decode_qr_attachments(
+    email: ParsedEmail,
+    decoder: QRDecoder,
+    *,
+    max_payload_bytes: int | None = None,
+) -> list[QRDecodeResult]:
+    """Decode every eligible image once, in message order. Never raises.
+
+    The single place in this layer that calls a `QRDecoder`. Extracted from
+    `analyze_qr_url` so the layer entry point can decode the images once, feed
+    the URLs they carry into `candidate_urls(extra=...)` before the shared
+    candidate set is built, and then hand the same results back to the signal -
+    rather than decoding every image twice to get both.
+
+    Requires a decoder: "no decoder configured" is an abstention `analyze_qr_url`
+    reports for itself, not a decode result.
+    """
+    return [
+        _decode_attachment(email, attachment, decoder, max_payload_bytes)
+        for attachment in eligible_qr_attachments(email)
+    ]
+
+
+def qr_extracted_urls(results: Sequence[QRDecodeResult]) -> list[ExtractedURL]:
+    """The URLs decoded images carry, as `ExtractedURL(source=QR_CODE)`.
+
+    Section 4's "extracted URL re-enters the URL signal set", isolated so the
+    entry point can perform that re-entry once. Only answered results
+    contribute, and no validation happens here: `candidate_urls` remains the
+    one place that decides what is an analysable URL, and a payload is never
+    dereferenced.
+    """
+    extra: list[ExtractedURL] = []
+    for result in results:
+        if result.is_answer:
+            extra.extend(result.as_extracted_urls())
+    return extra
+
+
 def analyze_qr_url(
     email: ParsedEmail,
     *,
     decoder: QRDecoder | None = None,
     max_payload_bytes: int | None = None,
+    decoded: Sequence[QRDecodeResult] | None = None,
+    candidates: Sequence[URLCandidate] | None = None,
 ) -> DetectionSignal:
     """Flag URLs concealed inside the message's images.
 
@@ -1867,6 +1971,13 @@ def analyze_qr_url(
 
     Never raises. Never opens a socket. Never mutates the message, the
     attachments or the candidates.
+
+    `decoded` and `candidates` are the integration seam the layer entry point
+    uses: both default to None and are then computed exactly as before, so a
+    caller that passes neither sees the behaviour this signal has always had.
+    Passing them lets `layers.l2_urls.analyze` decode each image once and build
+    the shared candidate set - which already contains the QR URLs - a single
+    time for the whole layer.
     """
     eligible = eligible_qr_attachments(email)
 
@@ -1888,7 +1999,7 @@ def analyze_qr_url(
             metadata=metadata,
         )
 
-    if decoder is None:
+    if decoder is None and decoded is None:
         failures = [
             {**_provenance(attachment), "error": "no QR decoder configured"}
             for attachment in eligible
@@ -1904,10 +2015,11 @@ def analyze_qr_url(
             error="no QR decoder configured",
         )
 
-    results = [
-        _decode_attachment(email, attachment, decoder, max_payload_bytes)
-        for attachment in eligible
-    ]
+    results = (
+        list(decoded)
+        if decoded is not None
+        else decode_qr_attachments(email, decoder, max_payload_bytes=max_payload_bytes)
+    )
 
     inspected = [result for result in results if result.is_answer]
     failures = [
@@ -1926,7 +2038,9 @@ def analyze_qr_url(
             extra.append(extracted)
             origin.setdefault(extracted.url, result)
 
-    candidates = candidate_urls(email, extra=extra)
+    candidates = (
+        list(candidates) if candidates is not None else candidate_urls(email, extra=extra)
+    )
     qr_candidates = [c for c in candidates if c.source is URLSource.QR_CODE]
     analysable = {c.raw for c in qr_candidates}
 
@@ -2036,3 +2150,545 @@ def _qr_signal(
         metadata={**metadata, "fired": score > 0.0 and error is None},
         error=error,
     )
+
+
+# --------------------------------------------------------------------------
+# l2.captcha_gate
+# --------------------------------------------------------------------------
+#
+# ARCHITECTURE.md section 4: "Playwright render of terminal URL; detect
+# Turnstile/hCaptcha/reCAPTCHA in DOM." Section 10: "Playwright hangs on
+# attacker page -> hard timeout, kill context, completed=False."
+#
+# This function renders nothing and follows nothing. It reads `RedirectTrace`s
+# that `l2.redirect_depth`'s follower already produced, asks an injected
+# `PageRenderer` about the terminal URL of each, and turns the `RenderResult`s
+# into one signal. No renderer is constructed here and Playwright is not
+# imported - there is none in this repository, which is why this signal
+# abstains rather than reporting every landing page as ungated.
+#
+# **Why a captcha is a phishing indicator.** It is not that challenges are
+# malicious - they are ordinary on legitimate login pages. It is that a
+# credential-harvesting page which puts Turnstile in front of its form is
+# deliberately excluding automated scanners while remaining usable by the
+# victim who was sent the link. Combined with the other Layer 2 signals - a
+# branded anchor, a deep redirect chain, a URL that arrived inside a QR code -
+# a challenge on the terminal page is the kit protecting itself.
+
+# Hand-assigned for Phase A on the same terms as every other score here, and
+# refitted in Phase 5. Section 4 assigns no score to any signal.
+#
+# 0.70, level with `l2.base64_email_param` and the capped-redirect case. A
+# challenge on the page a message's link finally reaches is strong evidence of
+# deliberate scanner evasion, but it is not conclusive on its own: a link to a
+# genuine Microsoft or Cloudflare-fronted login page renders a real challenge
+# too. It is scored as strong corroboration, not as a verdict.
+CAPTCHA_GATE_SCORE = 0.70
+
+
+def terminal_urls(
+    candidates: Sequence[URLCandidate],
+    traces: Sequence[RedirectTrace],
+) -> dict[str, str]:
+    """Map each candidate's raw URL to the terminal URL of its redirect chain.
+
+    The association needs no new state: `analyze_redirect_depth` walks
+    `candidate.raw`, and `RedirectTrace.url` preserves exactly that string, so
+    matching the two is exact rather than heuristic.
+
+    Only chains that reached an answer *and* came to rest contribute. A
+    `SETTLED` trace of depth 0 maps a URL to itself - it is its own terminal
+    URL, which is the ordinary case for a direct link. A `CAPPED` chain has no
+    `final_url` by contract, and an `UNREACHABLE`, `TIMED_OUT` or
+    `NOT_ATTEMPTED` chain has none either, so neither yields anything to
+    render: there is no terminal page to look at, and rendering an intermediate
+    hop would be looking at the wrong one.
+
+    Candidates with no trace are absent from the result, not mapped to
+    themselves. Without a followed chain this layer does not know whether a URL
+    is terminal, and rendering on that assumption would be a claim it has no
+    basis for.
+    """
+    by_url = {trace.url: trace for trace in traces}
+    resolved: dict[str, str] = {}
+    for candidate in candidates:
+        trace = by_url.get(candidate.raw)
+        if trace is not None and trace.is_answer and trace.final_url is not None:
+            resolved[candidate.raw] = trace.final_url
+    return resolved
+
+
+def _render(renderer: PageRenderer, url: str) -> RenderResult:
+    """One render, through the seam. Never raises.
+
+    The seam's contract forbids raising, so a renderer that does is broken
+    rather than authoritative and is recorded as `UNREACHABLE` - exactly as a
+    refused connection would be. The same goes for one returning something that
+    is not a `RenderResult`.
+    """
+    try:
+        result = renderer.render(url)
+    except Exception as exc:  # noqa: BLE001 - the seam forbids this
+        return RenderResult(
+            url=url,
+            outcome=RenderOutcome.UNREACHABLE,
+            error=f"renderer raised {type(exc).__name__}: {exc}",
+        )
+    if not isinstance(result, RenderResult):
+        return RenderResult(
+            url=url,
+            outcome=RenderOutcome.UNREACHABLE,
+            error=f"renderer returned {type(result).__name__}, not a RenderResult",
+        )
+    return result
+
+
+def analyze_captcha_gate(
+    email: ParsedEmail,
+    *,
+    renderer: PageRenderer | None = None,
+    traces: Sequence[RedirectTrace] = (),
+    extra: Sequence[ExtractedURL] = (),
+    candidates: Sequence[URLCandidate] | None = None,
+) -> DetectionSignal:
+    """Flag links whose terminal page is gated by a challenge widget.
+
+    `traces` are the `RedirectTrace`s produced for this message by
+    `l2.redirect_depth`'s follower. **This function never follows a redirect**
+    - there is one hop-following mechanism in this layer and it is
+    `RedirectFollower`. A URL with no answered trace has no known terminal
+    page, so it is not rendered and is recorded as uncheckable rather than
+    assumed to be its own destination.
+
+    Each terminal URL is rendered independently, so one page that will not load
+    costs that page alone and never suppresses a finding from another.
+
+    Evidence quotes the original URL as the message contained it; the metadata
+    additionally carries the terminal URL that was actually rendered, the
+    challenge kinds found and the markers that matched - a finding that says
+    only "a captcha was detected" is not evidence.
+
+    Abstains when eligible URLs could not be rendered: no renderer injected, no
+    terminal URL, or a render that failed. A finding survives that. A message
+    is never reported clean while an eligible URL went unrendered.
+
+    Never raises. Never opens a socket, resolves a name, follows a redirect or
+    launches a browser: all of that is behind the injected seams.
+
+    `candidates` is the shared-candidate seam described on
+    `analyze_redirect_depth`: None recomputes the set exactly as before. The
+    `traces` this reads are the ones the layer entry point already produced for
+    `l2.redirect_depth`, which is why this function has no follower of its own.
+    """
+    candidates = (
+        list(candidates) if candidates is not None else candidate_urls(email, extra=extra)
+    )
+    resolved = terminal_urls(candidates, traces)
+
+    metadata: dict[str, object] = {
+        "urls_in_message": len(email.urls),
+        "urls_checked": len(candidates),
+        "urls_with_terminal": len(resolved),
+        "pages_rendered": 0,
+        "matches": [],
+        "clean_pages": [],
+        "failures": [],
+    }
+
+    if not candidates:
+        return _captcha_signal(
+            0.0,
+            RiskLevel.LOW,
+            "The message contains no analysable URLs, so there was no page to "
+            "render.",
+            metadata=metadata,
+        )
+
+    if not resolved:
+        # Nothing was followed, so nothing has a known terminal page. This is
+        # the state the pipeline ships in, because there is no follower.
+        return _captcha_signal(
+            0.0,
+            RiskLevel.LOW,
+            f"None of the {len(candidates)} URL(s) in this message has a resolved "
+            f"terminal page, so none could be rendered. This is an absence of "
+            f"information, not a clean result.",
+            metadata=metadata,
+            error="no terminal URL was available to render",
+        )
+
+    if renderer is None:
+        metadata["failures"] = [
+            {"url": raw, "terminal_url": terminal, "error": "no page renderer configured"}
+            for raw, terminal in resolved.items()
+        ]
+        return _captcha_signal(
+            0.0,
+            RiskLevel.LOW,
+            f"No page renderer is configured, so the {len(resolved)} terminal "
+            f"page(s) in this message were not inspected. This is an absence of "
+            f"information, not a clean result.",
+            metadata=metadata,
+            error="no page renderer configured",
+        )
+
+    matches: list[dict[str, object]] = []
+    clean: list[dict[str, object]] = []
+    failures: list[dict[str, object]] = []
+
+    for raw, terminal in resolved.items():
+        result = _render(renderer, terminal)
+        row: dict[str, object] = {"url": raw, "terminal_url": terminal}
+
+        if not result.is_answer:
+            failures.append({**row, "error": result.error or result.outcome.value})
+            continue
+
+        if result.has_challenge:
+            matches.append(
+                {
+                    **row,
+                    "rendered_url": result.final_url,
+                    "kinds": [kind.value for kind in result.kinds],
+                    "markers": [challenge.marker for challenge in result.challenges],
+                }
+            )
+        else:
+            clean.append({**row, "rendered_url": result.final_url})
+
+    metadata.update(
+        pages_rendered=len(matches) + len(clean),
+        matches=matches,
+        clean_pages=clean,
+        failures=failures,
+    )
+
+    if matches:
+        described = "; ".join(
+            f"{match['url']} lands on {match['terminal_url']}, which is gated by "
+            f"{', '.join(match['kinds'])}"
+            for match in matches[:3]
+        )
+        more = f", and {len(matches) - 3} more" if len(matches) > 3 else ""
+        caveat = (
+            f" {len(failures)} other page(s) could not be rendered."
+            if failures
+            else ""
+        )
+        return _captcha_signal(
+            CAPTCHA_GATE_SCORE,
+            _severity(CAPTCHA_GATE_SCORE),
+            f"{len(matches)} of this message's link(s) end at a page behind a "
+            f"challenge widget, which keeps automated scanners out while the "
+            f"recipient can still proceed: {described}{more}.{caveat}",
+            metadata=metadata,
+        )
+
+    if failures:
+        reasons = "; ".join(
+            f"{failure['terminal_url']}: {failure['error']}" for failure in failures
+        )
+        return _captcha_signal(
+            0.0,
+            RiskLevel.LOW,
+            f"{len(failures)} of the {len(resolved)} terminal page(s) in this "
+            f"message could not be rendered ({reasons}), so the message was not "
+            f"fully checked. This is an absence of information, not a clean result.",
+            metadata=metadata,
+            error=f"{len(failures)} of {len(resolved)} page(s) could not be rendered",
+        )
+
+    return _captcha_signal(
+        0.0,
+        RiskLevel.LOW,
+        f"All {len(clean)} terminal page(s) in this message rendered without a "
+        f"Turnstile, hCaptcha or reCAPTCHA challenge.",
+        metadata=metadata,
+    )
+
+
+def _captcha_signal(
+    score: float,
+    severity: RiskLevel,
+    evidence: str,
+    *,
+    metadata: dict[str, object],
+    error: str | None = None,
+) -> DetectionSignal:
+    return DetectionSignal(
+        layer=DetectionLayer.L2,
+        name="captcha_gate",
+        score=score,
+        severity=severity,
+        evidence=evidence,
+        metadata={**metadata, "fired": score > 0.0 and error is None},
+        error=error,
+    )
+
+
+# --------------------------------------------------------------------------
+# The layer
+# --------------------------------------------------------------------------
+#
+# Everything above is one signal each. This is the layer: it computes the
+# shared inputs once, hands them to all five signals, and speaks the
+# orchestrator's completed/incomplete vocabulary. The arrangement is the one
+# `l3_nlp` and `l4_intel` already use - a synchronous `analyze` that always
+# returns every signal, and an `analyze_async` adapter that is the
+# `LayerCallable` and is the only thing that ever raises.
+#
+# What is shared, and why it has to be
+# ------------------------------------
+# Four of the five signals ask about the same URLs, and two of them read the
+# same redirect traces. Left to themselves each signal rebuilds the candidate
+# set from the message, and `l2.redirect_depth` and `l2.captcha_gate` would
+# each walk every attacker-controlled chain - two full sets of requests to
+# hostile infrastructure for one message, with the second set free to answer
+# differently from the first. So the entry point does the shared work:
+#
+#   decode the images once   -> QRDecodeResult[]
+#   re-enter their URLs once -> candidate_urls(email, extra=...)  [ONE call]
+#   walk each candidate once -> RedirectTrace[]                   [ONE per URL]
+#
+# and passes the *same objects* down. `l2.captcha_gate` has no follower and
+# never acquires one: it reads the traces this produced, which is why the
+# terminal-URL rules in `terminal_urls` are the only way a page is ever chosen
+# for rendering.
+
+
+# Phase A: the hard ceiling on attacker-controlled browser work per message.
+#
+# Rendering is the most expensive and most dangerous thing this project does -
+# it executes an attacker's JavaScript - and the number of pages is chosen by
+# whoever wrote the email. A message carrying forty links whose chains all
+# settle would otherwise mean forty browser renders inside a 15s layer budget:
+# the layer would blow its timeout, come back `completed=False`, and a message
+# would have bought itself a guaranteed Layer 2 outage by adding links.
+#
+# So the count is capped rather than the clock. Two, deliberately small:
+# `HttpRedirectFollower`'s 12s budget is per URL and already consumes most of
+# `DEFAULT_LAYER_TIMEOUTS[L2]`, so there is no room to promise more, and Phase
+# A has no measurement to justify a larger number. The policy is deterministic
+# - the first N eligible terminal candidates in candidate order, which is
+# message order - so the same message always renders the same pages.
+#
+# Pages past the cap are **not** silently treated as clean. They come back
+# `NOT_ATTEMPTED`, `l2.captcha_gate` records them as uncheckable and abstains,
+# and the layer is uninformative rather than falsely clear. Raising this
+# number is a Phase B decision to be made against measured render latency, not
+# here.
+MAX_RENDERED_PAGES_PER_EMAIL = 2
+
+
+class _BoundedRenderer:
+    """A `PageRenderer` that stops after `MAX_RENDERED_PAGES_PER_EMAIL` pages.
+
+    Wraps the injected renderer rather than teaching `l2.captcha_gate` a limit,
+    so the signal's semantics are untouched: past the cap it receives a
+    `NOT_ATTEMPTED` result, which is the same thing it already gets from a
+    renderer that could not load a page, and it abstains on it. A page nobody
+    looked at is never reported as a page with no challenge on it.
+    """
+
+    def __init__(self, renderer: PageRenderer, limit: int) -> None:
+        self._renderer = renderer
+        self._remaining = max(0, int(limit))
+        self.rendered = 0
+
+    def render(self, url: str) -> RenderResult:
+        if self._remaining <= 0:
+            return RenderResult.not_attempted(
+                url,
+                f"per-message render cap of {MAX_RENDERED_PAGES_PER_EMAIL} page(s) "
+                f"reached, so this page was not inspected",
+            )
+        self._remaining -= 1
+        self.rendered += 1
+        return self._renderer.render(url)
+
+
+class Layer2Uninformative(RuntimeError):
+    """Layer 2 ran but learned nothing about the message.
+
+    Raised by `analyze_async` - never by `analyze`, and never by a signal - to
+    tell the orchestrator `completed=False`, which is the vocabulary
+    ARCHITECTURE.md section 2 already has for "no information". The same
+    device, and the same reasoning, as `l3_nlp.Layer3Uninformative` and
+    `l4_intel.Layer4Uninformative`.
+
+    Layer 2 needs it acutely, because its signals are split between two kinds.
+    `base64_email_param` and `domain_mismatch_brand` are offline: given a URL
+    they always reach an answer. `redirect_depth`, `captcha_gate` and `qr_url`
+    depend on egress, a browser and an image decoder respectively - none of
+    which this repository ships. With none of them configured, the offline pair
+    reports two genuine negatives, the other three abstain, and a completed
+    layer would be scored a confident 0.0 by `scoring.composite.layer_score` at
+    Layer 2's full **0.30** weight - the largest share in the config, tied with
+    Layer 1. A lone DMARC failure at 0.85 would come back as 0.42: MEDIUM, on
+    the strength of two string checks that never touched the parts of the
+    message the layer exists to look at.
+
+    The rule, and it is stricter than Layer 4's: **an unabstained signal is not
+    enough; the layer must have finished the analysis it started.**
+
+      - Any real finding makes the layer informative, whatever else abstained.
+        A URL that hides a base64 recipient address is hiding one regardless of
+        whether the browser was available.
+      - Otherwise, if *any* signal carries an error, the layer is
+        uninformative. Two offline signals coming back clean while the redirect
+        walk, the render and the decode were never attempted is exactly the
+        case this class exists for: unavailable analysis must not masquerade as
+        clean evidence.
+      - Otherwise the layer is informative. In particular a message with no
+        URLs and no images is a genuine clean result and **does** consume Layer
+        2's 0.30: the layer examined the URL surface, found there was nothing
+        on it to inspect, and reached that answer with nothing missing. That is
+        a conclusion, not an absence of information - which is the case
+        `Layer4Uninformative` decides the other way, because Layer 4 correlates
+        indicators against feeds and a message with no indicators tells it
+        nothing, whereas "this message contains no links at all" is itself
+        something Layer 2 knows about the message.
+
+    No signal's score, metadata, evidence or error changes either way; this is
+    a distinction the adapter draws over signals it does not touch.
+    """
+
+
+def _is_informative(signals: Sequence[DetectionSignal]) -> bool:
+    """True when the layer reached a conclusion worth scoring.
+
+    One question, asked of the signals as they already report themselves: did
+    anything go uninspected? An abstaining signal sets `error`; a signal that
+    reached its answer leaves it None. So the rule reduces to "every signal
+    answered", with a finding overriding a sibling's abstention because a URL
+    that hides a recipient address hides one whether or not the browser was
+    available.
+
+    See `Layer2Uninformative` for why the second clause is stricter here than
+    in Layer 4, and why a message with no URLs is not caught by it.
+    """
+    if any(signal.error is None and signal.score > 0.0 for signal in signals):
+        return True
+    return not any(signal.error is not None for signal in signals)
+
+
+def analyze(
+    email: ParsedEmail,
+    *,
+    follower: RedirectFollower | None = None,
+    renderer: PageRenderer | None = None,
+    decoder: QRDecoder | None = None,
+    max_payload_bytes: int | None = None,
+    max_rendered_pages: int = MAX_RENDERED_PAGES_PER_EMAIL,
+) -> list[DetectionSignal]:
+    """Run every Layer 2 signal over one message.
+
+    Five signals, always, in the order of the ARCHITECTURE.md section 4 table:
+    `base64_email_param`, `redirect_depth`, `captcha_gate`, `qr_url`,
+    `domain_mismatch_brand`.
+
+    Graceful degradation is per signal, not per layer, exactly as in Layers 1,
+    3 and 4. With no seams injected at all - the state this repository ships in
+    - the two offline signals answer and the other three abstain; none of them
+    crashes and none of them claims the message is clean. `analyze_async` is
+    what turns "all of them abstained" into `completed=False`.
+
+    The shared work happens here and only here: the images are decoded once,
+    `candidate_urls` is called once over the message plus the URLs those images
+    carried, and each candidate's redirect chain is walked once. The resulting
+    `RedirectTrace` objects are the same ones both `redirect_depth` and
+    `captcha_gate` read.
+
+    Every seam is injected and nothing vendor-specific is constructed here.
+    Network work is sequential: these are requests to infrastructure the
+    attacker controls, and this layer does not fan them out.
+
+    Never raises.
+    """
+    # The images first: their URLs have to be in the candidate set before it is
+    # built, which is section 4's "extracted URL re-enters the URL signal set".
+    decoded = (
+        decode_qr_attachments(email, decoder, max_payload_bytes=max_payload_bytes)
+        if decoder is not None
+        else None
+    )
+    extra = qr_extracted_urls(decoded) if decoded is not None else []
+
+    candidates = candidate_urls(email, extra=extra)
+    traces = follow_candidates(candidates, follower)
+
+    bounded = _BoundedRenderer(renderer, max_rendered_pages) if renderer is not None else None
+
+    return [
+        analyze_base64_email_param(email, candidates=candidates),
+        analyze_redirect_depth(
+            email, follower=follower, candidates=candidates, traces=traces
+        ),
+        analyze_captcha_gate(
+            email, renderer=bounded, traces=traces, candidates=candidates
+        ),
+        analyze_qr_url(
+            email,
+            decoder=decoder,
+            max_payload_bytes=max_payload_bytes,
+            decoded=decoded,
+            candidates=candidates,
+        ),
+        analyze_domain_mismatch_brand(email, candidates=candidates),
+    ]
+
+
+# Layer 2's work is blocking network I/O - `httpx.Client` in the redirect
+# follower, a synchronous browser behind `PageRenderer`, a synchronous image
+# decoder behind `QRDecoder` - and the seams are synchronous by design so the
+# unit suite can drive them with plain fakes. Running them inline would block
+# the event loop and stall the three layers beside this one, so the whole layer
+# goes to a worker thread at this boundary and nowhere else. No individual
+# signal is async. That is the arrangement `l3_nlp` and `l4_intel` already use.
+
+
+async def analyze_async(
+    email: ParsedEmail,
+    *,
+    follower: RedirectFollower | None = None,
+    renderer: PageRenderer | None = None,
+    decoder: QRDecoder | None = None,
+    max_payload_bytes: int | None = None,
+    max_rendered_pages: int = MAX_RENDERED_PAGES_PER_EMAIL,
+) -> list[DetectionSignal]:
+    """`analyze` for an event loop. This is the orchestrator's `LayerCallable`.
+
+    Same five signals, same order, same contents. The orchestrator bounds this
+    with `DEFAULT_LAYER_TIMEOUTS[L2]`, which is 15s; the redirect follower sets
+    its own shorter budget and the render count is capped by
+    `MAX_RENDERED_PAGES_PER_EMAIL`, so a hostile message runs out of attempts
+    before the layer timeout becomes the operative limit - the arrangement
+    Layer 1 uses for WHOIS and Layer 4 for its feeds.
+
+    Raises `Layer2Uninformative` when the layer learned nothing - see that class
+    for why a layer whose egress, browser and decoder are all missing must not
+    be scored as a clean 0.0 at 0.30 of the composite. `analyze` itself always
+    returns all five signals; only this adapter, which speaks the orchestrator's
+    completed/incomplete vocabulary, makes that distinction.
+    """
+    signals = await asyncio.to_thread(
+        analyze,
+        email,
+        follower=follower,
+        renderer=renderer,
+        decoder=decoder,
+        max_payload_bytes=max_payload_bytes,
+        max_rendered_pages=max_rendered_pages,
+    )
+
+    if not _is_informative(signals):
+        reasons = "; ".join(
+            f"{signal.name}: {signal.error}" for signal in signals if signal.error
+        )
+        raise Layer2Uninformative(
+            f"no Layer 2 signal reached a conclusion ({reasons})"
+            if reasons
+            else "no Layer 2 signal reached a conclusion"
+        )
+
+    return signals

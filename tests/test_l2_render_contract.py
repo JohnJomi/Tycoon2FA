@@ -315,7 +315,10 @@ def test_no_renderer_implementation_ships_in_this_repository() -> None:
         name
         for name in dir(module)
         if isinstance(getattr(module, name), type)
-        and name != "PageRenderer"
+        # `_BoundedRenderer` is the per-message render cap: it renders nothing
+        # itself, and either delegates or returns NOT_ATTEMPTED. Excluded by
+        # name, so a real renderer appearing here would still fail this.
+        and name not in ("PageRenderer", "_BoundedRenderer")
         and hasattr(getattr(module, name), "render")
     ]
     assert concrete == []

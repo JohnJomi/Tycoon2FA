@@ -235,8 +235,13 @@ async def test_layer_one_and_the_other_layers_are_unchanged(email) -> None:
         "domain_age_lt_7d",
         "display_name_impersonation",
     ]
-    assert by_layer[DetectionLayer.L2].completed is False
-    assert "not implemented" in by_layer[DetectionLayer.L2].error
+    # Layer 2 is written now. This message has no URL surface and no images, so
+    # the layer had nothing to inspect and reached that answer with nothing
+    # missing: a genuine negative, which completes. It is the presence of an
+    # uninspectable URL - not the absent egress, browser and decoder on their
+    # own - that makes the layer uninformative.
+    assert by_layer[DetectionLayer.L2].completed is True
+    assert by_layer[DetectionLayer.L2].error is None
     # L4 is written now; this message's URLs are not checkable without feeds.
     assert by_layer[DetectionLayer.L4].completed is False
     assert by_layer[DetectionLayer.L4].error is not None
