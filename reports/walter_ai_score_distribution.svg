@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 620 260" width="620" height="260" role="img" aria-label="Walter Writes ai_score by group">
+<style>
+  text { font: 12px system-ui, -apple-system, sans-serif; fill: #1f2937; }
+  .lbl { font-weight: 600; } .tick { font-size: 11px; fill: #6b7280; text-anchor: middle; }
+  .axis { stroke: #d1d5db; stroke-width: 1; } .ttl { font-size: 13px; font-weight: 700; }
+  @media (prefers-color-scheme: dark) { text { fill: #e5e7eb; } .tick { fill: #9ca3af; } .axis { stroke: #4b5563; } }
+</style>
+<text x="52" y="26" class="ttl">Walter Writes ai_score by group</text>
+<text x="52" y="74" class="lbl">Personal (sent mail) (n=5)</text><line x1="52" y1="100" x2="568" y2="100" class="axis"/><circle cx="562.8" cy="100" r="6" fill="#2563eb" fill-opacity="0.65"/><circle cx="182.0" cy="100" r="6" fill="#2563eb" fill-opacity="0.65"/><circle cx="245.1" cy="100" r="6" fill="#2563eb" fill-opacity="0.65"/><circle cx="148.3" cy="100" r="6" fill="#2563eb" fill-opacity="0.65"/><circle cx="431.1" cy="100" r="6" fill="#2563eb" fill-opacity="0.65"/><text x="52" y="152" class="lbl">Kaggle phishing (n=5)</text><line x1="52" y1="178" x2="568" y2="178" class="axis"/><circle cx="182.8" cy="178" r="6" fill="#dc2626" fill-opacity="0.65"/><circle cx="182.8" cy="178" r="6" fill="#dc2626" fill-opacity="0.65"/><circle cx="182.7" cy="178" r="6" fill="#dc2626" fill-opacity="0.65"/><circle cx="182.7" cy="178" r="6" fill="#dc2626" fill-opacity="0.65"/><circle cx="182.7" cy="178" r="6" fill="#dc2626" fill-opacity="0.65"/>
+<line x1="52" y1="214" x2="568" y2="214" class="axis"/>
+<line x1="52.0" y1="214" x2="52.0" y2="220" class="axis"/><text x="52.0" y="234" class="tick">0.0</text><line x1="181.0" y1="214" x2="181.0" y2="220" class="axis"/><text x="181.0" y="234" class="tick">0.2</text><line x1="310.0" y1="214" x2="310.0" y2="220" class="axis"/><text x="310.0" y="234" class="tick">0.5</text><line x1="439.0" y1="214" x2="439.0" y2="220" class="axis"/><text x="439.0" y="234" class="tick">0.8</text><line x1="568.0" y1="214" x2="568.0" y2="220" class="axis"/><text x="568.0" y="234" class="tick">1.0</text>
+<text x="310" y="252" class="tick">ai_score (0 = human, 1 = AI-generated)</text>
+</svg>
