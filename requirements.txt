@@ -5,6 +5,10 @@
 # API surface (ARCHITECTURE.md section 8)
 fastapi>=0.115
 uvicorn[standard]>=0.30
+# Required by FastAPI to read multipart/form-data, which is how
+# POST /analyze/upload receives the .eml. FastAPI raises at import time
+# without it, so it is a hard dependency of api/app.py rather than an extra.
+python-multipart>=0.0.9
 
 # Email / HTML parsing (ARCHITECTURE.md section 3)
 beautifulsoup4>=4.12
